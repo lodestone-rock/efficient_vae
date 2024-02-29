@@ -175,13 +175,13 @@ def train(models, batch, loss_scale, train_rng):
 
 
     vae_loss_grad_fn = jax.value_and_grad(
-        fun=_vae_loss, argnums=[0, 1]  # differentiate encoder and decoder
+        fun=_vae_loss, argnums=[0, 1], has_aux=True  # differentiate encoder and decoder
     )
     disc_loss_grad_fn = jax.value_and_grad(
-        fun=_disc_loss, argnums=[0]  # differentiate discriminator
+        fun=_disc_loss, argnums=[0], has_aux=True  # differentiate discriminator
     )
     disc_gradient_penalty_grad_fn = jax.value_and_grad(
-        fun=_disc_gradient_penalty, argnums=[1]  # differentiate input
+        fun=_disc_gradient_penalty, argnums=[1], has_aux=False  # differentiate input
     )
 
 
