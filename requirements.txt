@@ -5,4 +5,6 @@ opencv-python
 pyarrow
 einops
 flax
+optax
+lpips-j
 # manually install jax!
