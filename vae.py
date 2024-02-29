@@ -107,6 +107,7 @@ class Encoder(nn.Module):
     conv_expansion_factor: int = 4
     eps:float = 1e-6
     group_count: int = 16
+    last_layer: str = "linear"
 
 
     def setup(self):
@@ -152,6 +153,25 @@ class Encoder(nn.Module):
 
         self.blocks = list(zip(self.down_layer_contraction_factor, down_projections, down_blocks))
 
+        # cant decide which is which so gonna put it in the config
+        if self.last_layer == "conv":
+            self.projections = EfficientConv(
+                features=self.down_layer_dim[-1] * 2,
+                kernel_size=self.down_layer_kernel_size[-1],
+                expansion_factor=self.conv_expansion_factor,
+                group_count=self.group_count,
+                use_bias=self.use_bias,
+                eps=self.eps,
+                classic_conv=self.down_layer_ordinary_conv[-1],
+                residual=False,
+            )
+
+        elif self.last_layer == "linear":
+            self.projections = nn.Dense(
+                features=self.down_layer_dim[-1] * 2,
+                use_bias=self.use_bias,
+            )
+
 
     def __call__(self, image):
 
@@ -160,7 +180,7 @@ class Encoder(nn.Module):
             image = pointwise(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
-
+        image = self.projections(image)
         return image
 
 
