@@ -12,80 +12,72 @@ import numpy as np
 import pandas as pd
 
 # Set up logging
-logging.basicConfig(filename='dataset_errors.log', level=logging.ERROR)
+# logging.basicConfig(filename='dataset_errors.log', level=logging.ERROR)
 
+from concurrent.futures import ThreadPoolExecutor
+import random
+from queue import Queue
 
-def threaded_data_loader(
-        dataset, 
-        batch_size=1, 
-        num_workers=10, 
-        collate_fn=None,
-        shuffle=False, 
-        prefetch_factor=4, 
-        seed=0, 
-        worker_timeout=None, 
-        dataloader_timeout=60, 
-        debug=False
-    ):
-    random.seed(seed)
-    # Create a ThreadPoolExecutor with the specified number of workers
-    executor = ThreadPoolExecutor(max_workers=num_workers)
+def threading_dataloader(dataset, batch_size=1, num_workers=10, collate_fn=None, shuffle=False, prefetch_factor=4, seed=0, timeout=None):
+    """
+    A function to load data using multiple threads. This function can be used to speed up the data loading process. 
     
-    # Define a function to fetch and process a batch of samples       
-    def process_batch(idx):
-        return dataset[idx]
+    Parameters:
+    dataset (iterable): The dataset to load.
+    batch_size (int, optional): The number of samples per batch. Defaults to 1.
+    num_workers (int, optional): The number of worker threads to use. Defaults to 10.
+    collate_fn (callable, optional): A function to collate samples into a batch. If None, the default collate_fn is used.
+    shuffle (bool, optional): Whether to shuffle the dataset before loading. Defaults to False.
+    prefetch_factor (int, optional): The number of batches to prefetch. Defaults to 4.
+    seed (int, optional): The seed for the random number generator. Defaults to 0.
+    timeout (int, optional): The maximum number of seconds to wait for a batch. If None, there is no timeout.
 
+    Yields:
+    object: A batch of data.
+    """
+    # Initialize a random number generator with the given seed
+    random.seed(seed)
+
+    # Create a ThreadPoolExecutor with the specified number of workers
+    workers = ThreadPoolExecutor(max_workers=num_workers)
+    overseer = ThreadPoolExecutor(max_workers=1)
 
     # Generate batches of indices based on the dataset size and batch size
     num_samples = len(dataset)
+    batch_indices = [list(range(i, min(i + batch_size, num_samples))) for i in range(0, num_samples, batch_size)]
     if shuffle:
         indices = list(range(num_samples))
         random.shuffle(indices)
         batch_indices = [indices[i:i+batch_size] for i in range(0, num_samples, batch_size)]
-    else:
-        batch_indices = [list(range(i, min(i + batch_size, num_samples))) for i in range(0, num_samples, batch_size)]
 
-    # Create a prefetch queue to store prefetched batches
-    prefetch_queue = Queue(maxsize=prefetch_factor)
+    # Create a queue to store prefetched batches
+    prefetch_queue = Queue(maxsize=prefetch_factor * num_workers)
+    
+    # Function to prefetch batches of samples
+    def batch_to_queue(indices):
+        """
+        Function to load a batch of data and put it into the prefetch queue.
 
-        # Function to prefetch batches of samples
-    def prefetch_batches():
+        Parameters:
+        indices (list): The indices of the samples in the batch.
+        """
+        batch = [dataset[i] for i in indices]
+        if collate_fn is not None:
+            batch = collate_fn(batch)
+        prefetch_queue.put(batch) # 1. if you want to ensure order use return instead of queue here
+    
+    # Submit the prefetch tasks to the worker threads
+    def overseer_thread():
         for indices in batch_indices:
-            tasks = [executor.submit(process_batch, batch) for batch in indices]
-            samples = []
-            for task in tasks:
-                try:
-                    samples.append(task.result(timeout=worker_timeout))
-                except Exception as e:
-                    if debug:
-                        print(f"stale batch at index {indices}")
-                    samples.append(None)
-            if len(samples) > 0:
-                prefetch_queue.put(samples)
-            else:
-                prefetch_queue.put("dummy")
+            workers.submit(batch_to_queue, indices) # 2. then store the future and re itterate it here and get the value
 
-    # Function to yield batches of samples
-    def data_generator():
-        current_index = 0
-        while True:
-            prefetch_thread = executor.submit(prefetch_batches)
-            next_batch = prefetch_queue.get(timeout=dataloader_timeout)
-            if collate_fn:
-                yield collate_fn(next_batch)
-            else:
-                yield next_batch
-            current_index += 1
-            if current_index == len(batch_indices):
-                executor.shutdown()
-                break
+    # just in case worker submit loop is too slow due to a ton of loops, fork it to another thread so the main thread can continue
+    overseer.submit(overseer_thread)
 
-    # Define the data loader generator function
-    def data_loader():
-        for batch in data_generator():
-            yield batch
+    # Yield the prefetched batches
+    for _ in range(len(batch_indices)):
+        yield prefetch_queue.get(timeout=timeout)
 
-    return data_loader
 
 def random_crop(image, crop_size):
     h, w = image.shape[:2]
@@ -94,12 +86,14 @@ def random_crop(image, crop_size):
     cropped_image = image[top:top+crop_size, left:left+crop_size]
     return cropped_image
 
+
 def rotate(image, angle):
     h, w = image.shape[:2]
     center = (w / 2, h / 2)
     rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
     rotated_image = cv2.warpAffine(image, rotation_matrix, (w, h))
     return rotated_image
+
 
 def scale(image, scale_factor):
     h, w = image.shape[:2]
@@ -123,7 +117,7 @@ class CustomDataset():
 
         row = self.data.iloc[idx]
         try:
-            print(idx)
+            # print(idx)
             response = requests.get(row['url'])
             img = np.asarray(bytearray(response.content), dtype=np.uint8)
             img = cv2.imdecode(img, cv2.IMREAD_COLOR)
@@ -137,16 +131,15 @@ class CustomDataset():
             
             return img
         except Exception as e:
-            logging.error(f"Error loading image at index {idx}: {str(e)}")
+            # logging.error(f"Error loading image at index {idx}: {str(e)}")
             return None
         
 
 # collate function here is to fill the gap due to lossy retrieval by simply filling the gap with random rotation of random sample
-
 def collate_fn(batch):
     # count none in batch and drop the batch if it's exceeded the treshold value
     none_count = 0
-    print(none_count)
+    # print(none_count)
     for x in batch:
         if x is None:
             none_count += 1
@@ -163,17 +156,28 @@ def collate_fn(batch):
 
     return result
 
-
 csv_file = "0035af9f90f581816acf269df5eb37ad.parquet"
+# csv_file = "https://huggingface.co/datasets/mlfoundations/datacomp_1b/resolve/main/0035af9f90f581816acf269df5eb37ad.parquet"
 dataset = CustomDataset(csv_file, square_size=256)
 
+def create_image_mosaic(images, rows, cols, output_file):
+    n, h, w, c = images.shape
+    mosaic = np.zeros((h * rows, w * cols, c), dtype=np.uint8)
+    
+    for i in range(min(n, rows * cols)):
+        row = i // cols
+        col = i % cols
+        mosaic[row*h:(row+1)*h, col*w:(col+1)*w, :] = images[i]
+    
+    cv2.imwrite(output_file, mosaic)
 
-
-t_dl = threaded_data_loader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn,  num_workers=50, prefetch_factor=100, worker_timeout=5)
+t_dl = threading_dataloader(dataset, batch_size=16, shuffle=True, collate_fn=collate_fn,  num_workers=50, prefetch_factor=1)
 
 data = []
-for i, x in enumerate(t_dl()):
-    if i > 3:
-        break
+for i, x in enumerate(t_dl):
+    print(f"{i}========================================================")
+    # if i > 4:
+    #     break
+    create_image_mosaic(x, 4, 4, f"{i}.png")
     data.append(x)
 print()
