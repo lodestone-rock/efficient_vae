@@ -1,4 +1,6 @@
 
 init.sh
 /.vscode
-
+*.parquet
+scratchboard.py
+__pycache__

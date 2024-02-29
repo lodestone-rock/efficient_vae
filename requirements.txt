@@ -1,0 +1,8 @@
+numpy
+pandas
+requests
+opencv-python
+pyarrow
+einops
+flax
+# manually install jax!
