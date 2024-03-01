@@ -65,7 +65,8 @@ class EfficientConv(nn.Module):
         # pointwise conv reformulated as matmul
         self.pointwise_contract = nn.Dense(
             features=self.features, 
-            use_bias=self.use_bias
+            use_bias=self.use_bias,
+            kernel_init=jax.nn.initializers.zeros
         )
 
     def __call__(self, x,):
@@ -171,6 +172,11 @@ class Encoder(nn.Module):
                 features=self.down_layer_dim[-1] * 2,
                 use_bias=self.use_bias,
             )
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
 
 
     def __call__(self, image):
@@ -180,6 +186,7 @@ class Encoder(nn.Module):
             image = pointwise(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
+        image = self.final_norm(image)
         image = self.projections(image)
         return image
 
@@ -240,6 +247,11 @@ class Discriminator(nn.Module):
             down_blocks.append(down_layers)
 
         self.blocks = list(zip(self.down_layer_contraction_factor, down_projections, down_blocks))
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
         self.classifier = nn.Dense(
                 features=1,
                 use_bias=self.use_bias,
@@ -253,7 +265,7 @@ class Discriminator(nn.Module):
             image = pointwise(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
-
+        image = self.final_norm(image)
         logits = self.classifier(image)
         return logits
 
@@ -323,13 +335,20 @@ class Decoder(nn.Module):
             
 
         self.blocks = list(zip(self.up_layer_contraction_factor, up_projections, up_blocks))
-
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
 
     def __call__(self, image):
 
-        for patch, pointwise, conv_layers in self.blocks:
+        for i, (patch, pointwise, conv_layers) in enumerate(self.blocks):
             for conv_layer in conv_layers:
                 image = conv_layer(image)
+            
+            if len(self.blocks)-1 == i:
+                image = self.final_norm(image)
             image = pointwise(image)
             image = depth_to_space(image, h=patch[0], w=patch[1]) 
 

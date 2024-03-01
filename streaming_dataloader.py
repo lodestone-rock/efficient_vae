@@ -131,6 +131,7 @@ class CustomDataset():
             
             return img
         except Exception as e:
+            return self.__getitem__(random.randrange(0, len(self.data)))
             # logging.error(f"Error loading image at index {idx}: {str(e)}")
             return None
         
@@ -156,28 +157,3 @@ def collate_fn(batch):
 
     return result
 
-csv_file = "0035af9f90f581816acf269df5eb37ad.parquet"
-# csv_file = "https://huggingface.co/datasets/mlfoundations/datacomp_1b/resolve/main/0035af9f90f581816acf269df5eb37ad.parquet"
-dataset = CustomDataset(csv_file, square_size=256)
-
-def create_image_mosaic(images, rows, cols, output_file):
-    n, h, w, c = images.shape
-    mosaic = np.zeros((h * rows, w * cols, c), dtype=np.uint8)
-    
-    for i in range(min(n, rows * cols)):
-        row = i // cols
-        col = i % cols
-        mosaic[row*h:(row+1)*h, col*w:(col+1)*w, :] = images[i]
-    
-    cv2.imwrite(output_file, mosaic)
-
-t_dl = threading_dataloader(dataset, batch_size=16, shuffle=True, collate_fn=collate_fn,  num_workers=50, prefetch_factor=1)
-
-data = []
-for i, x in enumerate(t_dl):
-    print(f"{i}========================================================")
-    # if i > 4:
-    #     break
-    create_image_mosaic(x, 4, 4, f"{i}.png")
-    data.append(x)
-print()
