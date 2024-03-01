@@ -56,7 +56,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         dec = Decoder(
             output_features = 3,
             up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (1024, 512, 256, 192, 128),
+            up_layer_dim = (256, 192, 192, 128, 128),
             up_layer_kernel_size = ( 3, 3, 3, 3, 3),
             up_layer_blocks = (2, 2, 2, 2, 2),
             up_layer_ordinary_conv = (False, False, False, False, False),
@@ -342,7 +342,6 @@ def main():
     WANDB_PROJECT_NAME = "vae"
     WANDB_RUN_NAME = "testing"
     WANDB_LOG_INTERVAL = 100
-    JIT = True
 
     # wandb logging
     if WANDB_PROJECT_NAME:
@@ -393,19 +392,20 @@ def main():
 
             if i % WANDB_LOG_INTERVAL == 0:
                 wandb.log(stats)
+                progress_bar.set_description(f'Loss: {stats}')
 
 
             # save every n steps
             if i % SAVE_EVERY == 0:
-                preview = jnp.concatenate([batch, output], axis = 1)
-                preview = np.array(((preview / 255 * 2 - 1) + 1) / 2 * 255, dtype=np.uint8)
+                preview = jnp.concatenate([batch, output], axis = 0)
+                preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                create_image_mosaic(preview, len(preview), 2, f"{i}.png")
+                create_image_mosaic(preview, 2, len(preview)//2, f"{i}.png")
                 wandb.log({"image": wandb.Image(f'{i}.png')})
 
                 ckpt_manager.save(i, models)
 
-            progress_bar.set_description(f'Loss: {stats}')
+            
             progress_bar.update(1)
 
 main()
