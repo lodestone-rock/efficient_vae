@@ -56,7 +56,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         dec = Decoder(
             output_features = 3,
             up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (256, 192, 192, 128, 128),
+            up_layer_dim = (1024, 512, 256, 192, 128),
             up_layer_kernel_size = ( 3, 3, 3, 3, 3),
             up_layer_blocks = (2, 2, 2, 2, 2),
             up_layer_ordinary_conv = (False, False, False, False, False),
@@ -366,46 +366,51 @@ def main():
     # Remove newline characters from each line and create a list
     parquet_urls = [parquet_url.strip() for parquet_url in parquet_urls]
 
-    for parquet_url in parquet_urls:
-        dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
-        t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=1, seed=SEED)
-        # Initialize the progress bar
-        progress_bar = tqdm(total=len(dataset), position=0)
+    try:
+        for parquet_url in parquet_urls:
+            dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
+            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=1, seed=SEED)
+            # Initialize the progress bar
+            progress_bar = tqdm(total=len(dataset), position=0)
 
-        for i, batch in enumerate(t_dl):
+            for i, batch in enumerate(t_dl):
 
-            batch = batch / 255 * 2 - 1
+                batch = batch / 255 * 2 - 1
 
-            batch = jax.tree_map(
-                lambda leaf: jax.device_put(
-                    leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel", None, None, None))
-                ),
-                batch,
-            )
+                batch = jax.tree_map(
+                    lambda leaf: jax.device_put(
+                        leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel", None, None, None))
+                    ),
+                    batch,
+                )
 
-            if NO_GAN:
-                # new_models_state, new_train_rng, pred_batch, (vae_loss, vae_loss_stats, disc_loss, disc_loss_stats)
-                models, train_rng, output, stats = train_vae_only(models, batch, LOSS_SCALE, train_rng)
-            else:
-                models, train_rng, output, stats = train(models, batch, LOSS_SCALE, train_rng)
-
-
-            if i % WANDB_LOG_INTERVAL == 0:
-                wandb.log(stats)
-                progress_bar.set_description(f'Loss: {stats}')
+                if NO_GAN:
+                    # new_models_state, new_train_rng, pred_batch, (vae_loss, vae_loss_stats, disc_loss, disc_loss_stats)
+                    models, train_rng, output, stats = train_vae_only(models, batch, LOSS_SCALE, train_rng)
+                else:
+                    models, train_rng, output, stats = train(models, batch, LOSS_SCALE, train_rng)
 
 
-            # save every n steps
-            if i % SAVE_EVERY == 0:
-                preview = jnp.concatenate([batch, output], axis = 0)
-                preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
+                if i % WANDB_LOG_INTERVAL == 0:
+                    wandb.log(stats)
+                    progress_bar.set_description(f'Loss: {stats}')
 
-                create_image_mosaic(preview, 2, len(preview)//2, f"{i}.png")
-                wandb.log({"image": wandb.Image(f'{i}.png')})
 
-                ckpt_manager.save(i, models)
+                # save every n steps
+                if i % SAVE_EVERY == 0:
+                    preview = jnp.concatenate([batch, output], axis = 0)
+                    preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-            
-            progress_bar.update(1)
+                    create_image_mosaic(preview, 2, len(preview)//2, f"{i}.png")
+                    wandb.log({"image": wandb.Image(f'{i}.png')})
+
+                    ckpt_manager.save(i, models)
+
+                
+                progress_bar.update(1)
+    except KeyboardInterrupt:
+        i = -1
+        print("Ctrl+C command detected. saving model before exiting...")
+        ckpt_manager.save(i, models)
 
 main()
