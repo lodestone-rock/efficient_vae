@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import logging
@@ -40,7 +41,7 @@ def threading_dataloader(dataset, batch_size=1, num_workers=10, collate_fn=None,
 
     # Create a ThreadPoolExecutor with the specified number of workers
     workers = ThreadPoolExecutor(max_workers=num_workers)
-    overseer = ThreadPoolExecutor(max_workers=1)
+    overseer = ThreadPoolExecutor(max_workers=2)
 
     # Generate batches of indices based on the dataset size and batch size
     num_samples = len(dataset)
@@ -71,8 +72,16 @@ def threading_dataloader(dataset, batch_size=1, num_workers=10, collate_fn=None,
         for indices in batch_indices:
             workers.submit(batch_to_queue, indices) # 2. then store the future and re itterate it here and get the value
 
+    def monitor_queue():
+        while True:
+            time.sleep(10)
+            print("dataloader queue:", prefetch_queue.qsize())
+            print("worker queue:", workers._work_queue.qsize())
+
     # just in case worker submit loop is too slow due to a ton of loops, fork it to another thread so the main thread can continue
     overseer.submit(overseer_thread)
+    overseer.submit(monitor_queue)
+
 
     # Yield the prefetched batches
     for _ in range(len(batch_indices)):
@@ -135,6 +144,30 @@ class CustomDataset():
             # logging.error(f"Error loading image at index {idx}: {str(e)}")
             return None
         
+class ImageFolderDataset():
+    def __init__(self, root_dir, square_size=50, seed=84):
+        self.root_dir = root_dir
+        self.file_list = os.listdir(root_dir)
+        self.square_size = square_size
+        random.seed(seed)
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        try:
+            img_name = os.path.join(self.root_dir, self.file_list[idx])
+            image = cv2.imread(img_name)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if image.shape[-1] != 3:
+                raise "image has more than 3 channel"
+            image = random_crop(image, self.square_size)
+            image = rotate(image, random.choice([0, 90, 180, 270]))
+        except Exception as e:
+            return self.__getitem__(random.randrange(0, len(self.file_list)))
+        
+        return image
+    
 
 # collate function here is to fill the gap due to lossy retrieval by simply filling the gap with random rotation of random sample
 def collate_fn(batch):
