@@ -74,9 +74,7 @@ class EfficientConv(nn.Module):
         # store input as residual identity
         if self.residual:
             residual = x
-        # pre norm
-        else:
-            x = self.rms_norm(x)
+        x = self.rms_norm(x)
         # use conv for early layer if possible
         if self.classic_conv:
             x = self.conv(x) 

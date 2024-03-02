@@ -330,7 +330,7 @@ def main():
     SAVE_MODEL_PATH = "orbax_ckpt"
     IMAGE_RES = 256
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-5
     LOSS_SCALE = {
         "mse_loss_scale": 1.0,
         "lpips_loss_scale": 1.0,
@@ -394,7 +394,7 @@ def main():
                 if i % WANDB_LOG_INTERVAL == 0:
                     wandb.log(stats)
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
-                    progress_bar.set_description(stats_rounded)
+                    progress_bar.set_description(f"{stats_rounded}")
 
 
                 # save every n steps
