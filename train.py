@@ -23,7 +23,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec
 from jax.sharding import NamedSharding
 from jax.experimental import mesh_utils
-
+cc.initialize_cache("jax_cache")
 
 # adjust this sharding mesh to create appropriate sharding rule
 devices = mesh_utils.create_device_mesh((jax.device_count(), 1))
@@ -393,7 +393,8 @@ def main():
 
                 if i % WANDB_LOG_INTERVAL == 0:
                     wandb.log(stats)
-                    progress_bar.set_description(f'Loss: {stats}')
+                    stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
+                    progress_bar.set_description(stats_rounded)
 
 
                 # save every n steps
