@@ -13,6 +13,7 @@ import flax.linen as nn
 import orbax.checkpoint
 from tqdm import tqdm
 import wandb
+import jmp
 
 from vae import Decoder, Encoder, Discriminator
 from utils import FrozenModel, create_image_mosaic
@@ -29,6 +30,13 @@ cc.initialize_cache("jax_cache")
 devices = mesh_utils.create_device_mesh((jax.device_count(), 1))
 # create axis name on how many parallelism slice you want on your model
 mesh = Mesh(devices, axis_names=("data_parallel", "model_parallel"))
+
+        # just fancy wrapper
+mixed_precision_policy = jmp.Policy(
+    compute_dtype=jnp.bfloat16,
+    param_dtype=jnp.float32,
+    output_dtype=jnp.float32
+)
 
 def checkpoint_manager(save_path, max_to_keep=2):
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -146,7 +154,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             disc_state,
         )
         lpips_state = jax.tree_map(
-            lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())),
+            lambda leaf: jax.device_put(jmp.cast_to_half(leaf), device=NamedSharding(mesh, PartitionSpec())),
             lpips_state,
         )
         return [enc_state, dec_state, disc_state, lpips_state]
@@ -160,6 +168,8 @@ def train_vae_only(models, batch, loss_scale, train_rng):
     enc_state, dec_state, lpips_state = models
 
     def _vae_loss(enc_params, dec_params, lpips_params, batch, loss_scale, vae_rng):
+        # cast input
+        enc_params, dec_params, lpips_params, batch = mixed_precision_policy.cast_to_compute((enc_params, dec_params, lpips_params, batch))
         latents = enc_state.apply_fn(enc_params, batch)
 
         # encoder is learning logvar instead of std 
@@ -177,7 +187,7 @@ def train_vae_only(models, batch, loss_scale, train_rng):
         # lpips loss
         lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
 
-        vae_loss = (
+        vae_loss = mixed_precision_policy.cast_to_output(
             mse_loss * loss_scale["mse_loss_scale"] + 
             lpips_loss * loss_scale["lpips_loss_scale"] + 
             kl_loss * loss_scale["kl_loss_scale"]
@@ -203,9 +213,10 @@ def train_vae_only(models, batch, loss_scale, train_rng):
         vae_rng
     )
     # update vae params
-    new_enc_state = enc_state.apply_gradients(grads=vae_grad[0])
-    new_dec_state = dec_state.apply_gradients(grads=vae_grad[1])
+    new_enc_state = enc_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[0]))
+    new_dec_state = dec_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[1]))
 
+    
 
     # pack models 
     new_models_state = new_enc_state, new_dec_state, lpips_state
@@ -223,6 +234,8 @@ def train(models, batch, loss_scale, train_rng):
     enc_state, dec_state, disc_state, lpips_state = models
 
     def _vae_loss(enc_params, dec_params, disc_params, lpips_params, batch, loss_scale, vae_rng):
+        # cast input
+        enc_params, dec_params, disc_params, lpips_params, batch = mixed_precision_policy.cast_to_compute((enc_params, dec_params, disc_params, lpips_params, batch))
         latents = enc_state.apply_fn(enc_params, batch)
 
         # encoder is learning logvar instead of std 
@@ -237,28 +250,49 @@ def train(models, batch, loss_scale, train_rng):
 
         # MSE loss
         mse_loss = ((batch - pred_batch) ** 2).mean()
+        mae_loss = (jnp.abs(batch - pred_batch)).mean()
         # lpips loss
         lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
         # disc loss (frozen)
         disc_fake_scores = disc_state.apply_fn(disc_params, pred_batch)
-        disc_loss = nn.softplus(-disc_fake_scores).mean()
+        disc_loss = nn.softplus(-disc_fake_scores).mean() * loss_scale["vae_disc_loss_scale"] 
 
-        vae_loss = (
+        vae_loss = mixed_precision_policy.cast_to_output(
             mse_loss * loss_scale["mse_loss_scale"] + 
+            mae_loss * loss_scale["mae_loss_scale"] +
             lpips_loss * loss_scale["lpips_loss_scale"] + 
-            disc_loss * loss_scale["vae_disc_loss_scale"] +
             kl_loss * loss_scale["kl_loss_scale"]
         )
 
+        # because discriminator is annoying 
+        # compute the grad contribution on the discriminator and tone it down
+        def intermediary_loss_fn(disc_loss, vae_loss):
+            return disc_loss + vae_loss
+        
+        # trying to figure out which grad make a dent and gonna rescale it
+        disc_loss_grad, vae_loss_grad = jax.grad(intermediary_loss_fn, argnums=[0,1])(disc_loss, vae_loss)
+
+
+        disc_scale = vae_loss_grad / (disc_loss_grad + 1e-6) * loss_scale["toggle_gan"]
+
+        jax.debug.print("disc_grad: {disc_loss_grad}", disc_loss_grad=disc_loss_grad)
+        jax.debug.print("vae_grad: {vae_loss_grad}", vae_loss_grad=vae_loss_grad)
+        jax.debug.print("gradient_ratio: {disc_scale}", disc_scale=disc_scale)
+        
+        vae_loss_final = intermediary_loss_fn(disc_loss * disc_scale, vae_loss)
+
         vae_loss_stats = {
-            "pixelwise_reconstruction_loss": mse_loss * loss_scale["mse_loss_scale"],
+            "mse_loss": mse_loss * loss_scale["mse_loss_scale"],
+            "mae_loss": mae_loss * loss_scale["mae_loss_scale"],
             "lpips_loss": lpips_loss * loss_scale["lpips_loss_scale"],
-            "discriminator_loss": disc_loss * loss_scale["vae_disc_loss_scale"],
+            "discriminator_loss": disc_loss * loss_scale["toggle_gan"],
             "kl_divergence_loss":  kl_loss * loss_scale["kl_loss_scale"]
         }
-        return vae_loss, (vae_loss_stats, pred_batch)
+        return vae_loss_final, (vae_loss_stats, pred_batch)
     
     def _disc_loss(disc_params, batch, reconstructed_batch, loss_scale):
+        # cast input
+        disc_params, batch, reconstructed_batch = mixed_precision_policy.cast_to_compute((disc_params,  batch, reconstructed_batch))
         # wasserstein GAN loss
         disc_fake_scores = disc_state.apply_fn(disc_params, reconstructed_batch)
         disc_real_scores = disc_state.apply_fn(disc_state.params, batch)
@@ -272,7 +306,7 @@ def train(models, batch, loss_scale, train_rng):
         
         regularization = (jax.grad(_disc_gradient_penalty, argnums=[1])(disc_state, batch)[0] ** 2).mean()
         # wgan
-        disc_loss = wgan_loss +  regularization * loss_scale["reg_1_scale"]
+        disc_loss = mixed_precision_policy.cast_to_output((wgan_loss +  regularization * loss_scale["reg_1_scale"]) * loss_scale["toggle_gan"])
 
 
         # just for monitoring
@@ -309,11 +343,12 @@ def train(models, batch, loss_scale, train_rng):
     )
 
     # update vae params
-    new_enc_state = enc_state.apply_gradients(grads=vae_grad[0])
-    new_dec_state = dec_state.apply_gradients(grads=vae_grad[1])
+    new_enc_state = enc_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[0]))
+    new_dec_state = dec_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[1]))
 
     # update discriminator params
-    new_disc_state = disc_state.apply_gradients(grads=disc_grad[0])
+    disc_grad = jax.tree_map(lambda x: x * loss_scale["toggle_gan"], disc_grad)
+    new_disc_state = disc_state.apply_gradients(grads=jmp.cast_to_full(disc_grad[0]))
 
     # pack models 
     new_models_state = new_enc_state, new_dec_state, new_disc_state, lpips_state
@@ -324,7 +359,7 @@ def train(models, batch, loss_scale, train_rng):
 
 
 def main():
-    BATCH_SIZE = 40
+    BATCH_SIZE = 32
     SEED = 0
     URL_TXT = "datacomp_1b.txt"
     SAVE_MODEL_PATH = "orbax_ckpt"
@@ -332,15 +367,18 @@ def main():
     SAVE_EVERY = 500
     LEARNING_RATE = 1e-4
     LOSS_SCALE = {
-        "mse_loss_scale": 1.0,
-        "lpips_loss_scale": 0.01,
+        "mse_loss_scale": 0.0,
+        "mae_loss_scale": 1,
+        "lpips_loss_scale": 0.25,
         "kl_loss_scale": 1e-6,
         "vae_disc_loss_scale": 0.5,
-        "reg_1_scale": 1e6
+        "reg_1_scale": 1,
+        "toggle_gan": 1
     }
+    GAN_TRAINING_START= 2000
     NO_GAN = False
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.01]_mse[1]_disc[0.5]_reg[1e8]_imagenet-1k"
+    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[0]_mae[1]_disc[0.5]_reg[1]_gan[5k]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -373,6 +411,7 @@ def main():
         "ramdisk/train_images_4",
     ]
 
+    _gan_start = 0
     try:
         for parquet_url in parquet_urls:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
@@ -382,6 +421,16 @@ def main():
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
             for i, batch in enumerate(t_dl):
+                
+                _gan_start += 1
+
+                progress_bar.set_description(f"steps until gan training: {_gan_start}")
+
+                if _gan_start > GAN_TRAINING_START:
+                    print("GAN TRAINING MODE START NOW")
+                    LOSS_SCALE["toggle_gan"] = 1
+                else:
+                    LOSS_SCALE["toggle_gan"] = 0 
 
                 batch = batch / 255 * 2 - 1
 
@@ -415,7 +464,7 @@ def main():
 
                     ckpt_manager.save(i, models)
 
-                if i > 2500:
+                if i > len(dataset)-10:
                     break
                 progress_bar.update(1)
     except KeyboardInterrupt:
