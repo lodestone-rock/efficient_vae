@@ -158,7 +158,6 @@ class ImageFolderDataset():
         try:
             img_name = os.path.join(self.root_dir, self.file_list[idx])
             image = cv2.imread(img_name)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             if image.shape[-1] != 3:
                 raise "image has more than 3 channel"
             image = random_crop(image, self.square_size)

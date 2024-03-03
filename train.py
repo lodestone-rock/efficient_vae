@@ -16,7 +16,7 @@ import wandb
 
 from vae import Decoder, Encoder, Discriminator
 from utils import FrozenModel, create_image_mosaic
-from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn
+from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn, ImageFolderDataset
 
 # sharding
 from jax.sharding import Mesh
@@ -184,9 +184,9 @@ def train_vae_only(models, batch, loss_scale, train_rng):
         )
 
         vae_loss_stats = {
-            "pixelwise_reconstruction_loss": mse_loss * loss_scale["mse_loss_scale"],
+            "mse_loss": mse_loss * loss_scale["mse_loss_scale"],
             "lpips_loss": lpips_loss * loss_scale["lpips_loss_scale"],
-            "kl_divergence_loss":  kl_loss * loss_scale["kl_loss_scale"]
+            "kl_div_loss":  kl_loss * loss_scale["kl_loss_scale"]
         }
         return vae_loss, (vae_loss_stats, pred_batch)
     
@@ -214,7 +214,7 @@ def train_vae_only(models, batch, loss_scale, train_rng):
 
     return new_models_state, new_train_rng, pred_batch, {**vae_loss_stats, **loss_stats}
 
-
+@jax.jit
 def train(models, batch, loss_scale, train_rng):
     # always create new RNG!
     vae_rng, new_train_rng = jax.random.split(train_rng, num=2)
@@ -229,7 +229,7 @@ def train(models, batch, loss_scale, train_rng):
         latent_mean, latent_logvar = rearrange(latents, "b h w (c split) -> split b h w c", split = 2)
 
         # KL loss
-        kl_loss = 0.5 * jnp.sum(latent_mean**2 + jnp.exp(latent_logvar) - 1.0 - latent_logvar, axis=[1, 2, 3])      
+        kl_loss = 0.5 * jnp.sum(latent_mean**2 + jnp.exp(latent_logvar) - 1.0 - latent_logvar, axis=[1, 2, 3]).mean()
 
         # reparameterization using logvar
         sample = latent_mean + jnp.exp(0.5 * latent_logvar) * jax.random.normal(vae_rng, latent_mean.shape)
@@ -238,10 +238,10 @@ def train(models, batch, loss_scale, train_rng):
         # MSE loss
         mse_loss = ((batch - pred_batch) ** 2).mean()
         # lpips loss
-        lpips_loss = lpips_state.call(lpips_params, batch, pred_batch)
+        lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
         # disc loss (frozen)
         disc_fake_scores = disc_state.apply_fn(disc_params, pred_batch)
-        disc_loss = nn.softplus(-disc_fake_scores)
+        disc_loss = nn.softplus(-disc_fake_scores).mean()
 
         vae_loss = (
             mse_loss * loss_scale["mse_loss_scale"] + 
@@ -258,9 +258,9 @@ def train(models, batch, loss_scale, train_rng):
         }
         return vae_loss, (vae_loss_stats, pred_batch)
     
-    def _disc_loss(disc_state, batch, reconstructed_batch, loss_scale):
+    def _disc_loss(disc_params, batch, reconstructed_batch, loss_scale):
         # wasserstein GAN loss
-        disc_fake_scores = disc_state.apply_fn(disc_state.params, reconstructed_batch)
+        disc_fake_scores = disc_state.apply_fn(disc_params, reconstructed_batch)
         disc_real_scores = disc_state.apply_fn(disc_state.params, batch)
         loss_fake = nn.softplus(disc_fake_scores)
         loss_real = nn.softplus(-disc_real_scores)
@@ -270,7 +270,7 @@ def train(models, batch, loss_scale, train_rng):
             # a regularization based on real image
             return disc_state.apply_fn(disc_state.params, batch).mean()
         
-        regularization = jax.grad(_disc_gradient_penalty, argnums=[1])(disc_state, batch) ** 2
+        regularization = (jax.grad(_disc_gradient_penalty, argnums=[1])(disc_state, batch)[0] ** 2).mean()
         # wgan
         disc_loss = wgan_loss +  regularization * loss_scale["reg_1_scale"]
 
@@ -309,11 +309,11 @@ def train(models, batch, loss_scale, train_rng):
     )
 
     # update vae params
-    new_enc_state = enc_state.apply_gradients(vae_grad[0])
-    new_dec_state = dec_state.apply_gradients(vae_grad[1])
+    new_enc_state = enc_state.apply_gradients(grads=vae_grad[0])
+    new_dec_state = dec_state.apply_gradients(grads=vae_grad[1])
 
     # update discriminator params
-    new_disc_state = disc_state.apply_gradients(disc_grad[0])
+    new_disc_state = disc_state.apply_gradients(grads=disc_grad[0])
 
     # pack models 
     new_models_state = new_enc_state, new_dec_state, new_disc_state, lpips_state
@@ -324,23 +324,23 @@ def train(models, batch, loss_scale, train_rng):
 
 
 def main():
-    BATCH_SIZE = 16
+    BATCH_SIZE = 40
     SEED = 0
     URL_TXT = "datacomp_1b.txt"
     SAVE_MODEL_PATH = "orbax_ckpt"
     IMAGE_RES = 256
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-5
+    LEARNING_RATE = 1e-4
     LOSS_SCALE = {
         "mse_loss_scale": 1.0,
-        "lpips_loss_scale": 1.0,
-        "kl_loss_scale": 2e-5,
+        "lpips_loss_scale": 0.01,
+        "kl_loss_scale": 1e-6,
         "vae_disc_loss_scale": 0.5,
-        "reg_1_scale": 1e4
+        "reg_1_scale": 1e6
     }
-    NO_GAN = True
+    NO_GAN = False
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "testing"
+    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.01]_mse[1]_disc[0.5]_reg[1e8]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -365,13 +365,21 @@ def main():
 
     # Remove newline characters from each line and create a list
     parquet_urls = [parquet_url.strip() for parquet_url in parquet_urls]
+    parquet_urls = [
+        "ramdisk/train_images_0",
+        "ramdisk/train_images_1",
+        "ramdisk/train_images_2",
+        "ramdisk/train_images_3",
+        "ramdisk/train_images_4",
+    ]
 
     try:
         for parquet_url in parquet_urls:
-            dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
+            # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
+            dataset = ImageFolderDataset(parquet_url, square_size=IMAGE_RES)
             t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=1, seed=SEED)
             # Initialize the progress bar
-            progress_bar = tqdm(total=len(dataset), position=0)
+            progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
             for i, batch in enumerate(t_dl):
 
@@ -394,12 +402,12 @@ def main():
                 if i % WANDB_LOG_INTERVAL == 0:
                     wandb.log(stats)
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
-                    progress_bar.set_description(f"{stats_rounded}")
+                    # progress_bar.set_description(f"{stats_rounded}")
 
 
                 # save every n steps
                 if i % SAVE_EVERY == 0:
-                    preview = jnp.concatenate([batch, output], axis = 0)
+                    preview = jnp.concatenate([batch[:4], output[:4]], axis = 0)
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
                     create_image_mosaic(preview, 2, len(preview)//2, f"{i}.png")
@@ -407,7 +415,8 @@ def main():
 
                     ckpt_manager.save(i, models)
 
-                
+                if i > 2500:
+                    break
                 progress_bar.update(1)
     except KeyboardInterrupt:
         i = -1

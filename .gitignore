@@ -4,5 +4,12 @@ init.sh
 *.parquet
 scratchboard.py
 __pycache__
-/orbax_ckpt
+/orbax_ckpt*
 /wandb
+init.sh
+/.vscode
+/jax
+*.png
+/ramdisk
+*.JPEG
+/jax_cache
