@@ -248,50 +248,90 @@ def train(models, batch, loss_scale, train_rng):
         sample = latent_mean + jnp.exp(0.5 * latent_logvar) * jax.random.normal(vae_rng, latent_mean.shape)
         pred_batch = dec_state.apply_fn(dec_params, sample)
 
-        # MSE loss
-        mse_loss = ((batch - pred_batch) ** 2).mean()
-        mae_loss = (jnp.abs(batch - pred_batch)).mean()
-        # lpips loss
-        lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
-        # disc loss (frozen)
-        disc_fake_scores = disc_state.apply_fn(disc_params, pred_batch)
-        disc_loss = nn.softplus(-disc_fake_scores).mean() * loss_scale["vae_disc_loss_scale"] 
+        def reconstruction_loss(
+            original: jax.Array,
+            reconstruction: jax.Array
+        ) -> jax.Array:
+            # MSE loss
+            mse_loss = ((original - reconstruction) ** 2).mean() * loss_scale["mse_loss_scale"]
+            mae_loss = (jnp.abs(original - reconstruction)).mean() * loss_scale["mae_loss_scale"]
+            # lpips loss
+            lpips_loss = lpips_state.call(lpips_params, original, reconstruction).mean() * loss_scale["lpips_loss_scale"]
+            # return a tuple of individual losses just for statistics
+            return mse_loss + mae_loss + lpips_loss, (mse_loss, mae_loss, lpips_loss)
+
+        def discriminator_loss(reconstruction: jax.Array) -> jax.Array:
+            # disc loss (frozen)
+            disc_fake_scores = disc_state.apply_fn(disc_params, reconstruction)
+            return nn.softplus(-disc_fake_scores).mean() * loss_scale["vae_disc_loss_scale"] 
+
+        rec_loss, (mse_loss, mae_loss, lpips_loss) = reconstruction_loss(batch, pred_batch)
+        disc_loss = discriminator_loss(pred_batch)
 
         vae_loss = mixed_precision_policy.cast_to_output(
-            mse_loss * loss_scale["mse_loss_scale"] + 
-            mae_loss * loss_scale["mae_loss_scale"] +
-            lpips_loss * loss_scale["lpips_loss_scale"] + 
+            rec_loss +
             kl_loss * loss_scale["kl_loss_scale"]
         )
 
-        # because discriminator is annoying 
-        # compute the grad contribution on the discriminator and tone it down
-        def vae_decode_loss_fn(sample):
-            pred_batch =  dec_state.apply_fn(dec_params, sample)
-            lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
-            mse_loss = ((batch - pred_batch) ** 2).mean()
-            mae_loss = (jnp.abs(batch - pred_batch)).mean()
-            kl_loss = 0.5 * jnp.sum(latent_mean**2 + jnp.exp(latent_logvar) - 1.0 - latent_logvar, axis=[1, 2, 3]).mean()
-            return mixed_precision_policy.cast_to_output(
-                mse_loss * loss_scale["mse_loss_scale"] + 
-                mae_loss * loss_scale["mae_loss_scale"] +
-                lpips_loss * loss_scale["lpips_loss_scale"] + 
-                kl_loss * loss_scale["kl_loss_scale"]
+        def calculate_adaptive_weight(latent: jax.Array) -> jax.Array:
+            def forward_over_last_layer(
+                last_layer: jax.Array,
+                params: dict,
+                latent: jax.Array
+            ) -> jax.Array:
+                # We need the whole params for the model but need the passed last layer to grad
+                # Save the old last layer, we need it later, and replace it with the passed one
+                old_lastlayer = params['decoder']['conv_out']['kernel']
+                params['decoder']['conv_out']['kernel'] = last_layer
+
+                decoder_out = dec_state.apply_fn(params, latent)
+
+                # Put the last layer back, so that this function is technically "side-effect free"
+                params['decoder']['conv_out']['kernel'] = old_lastlayer
+
+                return decoder_out
+
+            @jax.grad
+            def compute_vae_loss_ll(
+                last_layer: jax.Array,
+                params: dict,
+                latent: jax.Array,
+                original: jax.Array
+            ) -> jax.Array:
+                reconstruction = forward_over_last_layer(last_layer, params, latent)
+                rec_loss, _ = reconstruction_loss(original, reconstruction)
+                return rec_loss
+
+            @jax.grad
+            def compute_disc_loss_ll(
+                last_layer: jax.Array,
+                params: dict,
+                latent: jax.Array
+            ) -> jax.Array:
+                reconstruction = forward_over_last_layer(last_layer, params, latent)
+                return discriminator_loss(reconstruction)
+
+            rec_grads = compute_vae_loss_ll(
+                dec_params.params['decoder']['conv_out']['kernel'],
+                dec_params.params,
+                latent,
+                batch
             )
-        
-        def vae_disc_loss_fn(sample):
-            pred_batch = dec_state.apply_fn(dec_params, sample)
-            return nn.softplus(disc_state.apply_fn(disc_params, pred_batch)).mean() 
-        
-        # trying to figure out which grad make a dent and gonna rescale it
-        vae_loss_grad = jax.lax.stop_gradient(jax.grad(vae_decode_loss_fn, argnums=[0])(sample)[0].mean())
-        disc_loss_grad = jax.lax.stop_gradient(jax.grad(vae_disc_loss_fn, argnums=[0])(sample)[0].mean())
+            disc_grads = compute_disc_loss_ll(
+                dec_params.params['decoder']['conv_out']['kernel'],
+                dec_params.params,
+                latent
+            )
 
+            # Calculate the adaptive weight
+            d_weight = jnp.linalg.norm(rec_grads) / (jnp.linalg.norm(disc_grads) + 1e-4)
+            d_weight = jnp.clip(d_weight, 0.0, 1e4)
+            d_weight = d_weight * loss_scale["toggle_gan"]
 
-        disc_scale = vae_loss_grad / (disc_loss_grad + 1e-6) * loss_scale["toggle_gan"]
+            return jax.lax.stop_gradient(d_weight)
 
-        jax.debug.print("disc_grad: {disc_loss_grad}", disc_loss_grad=disc_loss_grad)
-        jax.debug.print("vae_grad: {vae_loss_grad}", vae_loss_grad=vae_loss_grad)
+        disc_scale = calculate_adaptive_weight(sample)
+
         jax.debug.print("gradient_ratio: {disc_scale}", disc_scale=disc_scale)
         
         vae_loss_final = disc_loss * disc_scale + vae_loss
