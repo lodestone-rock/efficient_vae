@@ -266,11 +266,26 @@ def train(models, batch, loss_scale, train_rng):
 
         # because discriminator is annoying 
         # compute the grad contribution on the discriminator and tone it down
-        def intermediary_loss_fn(disc_loss, vae_loss):
-            return disc_loss + vae_loss
+        def vae_decode_loss_fn(sample):
+            pred_batch =  dec_state.apply_fn(dec_params, sample)
+            lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
+            mse_loss = ((batch - pred_batch) ** 2).mean()
+            mae_loss = (jnp.abs(batch - pred_batch)).mean()
+            kl_loss = 0.5 * jnp.sum(latent_mean**2 + jnp.exp(latent_logvar) - 1.0 - latent_logvar, axis=[1, 2, 3]).mean()
+            return mixed_precision_policy.cast_to_output(
+                mse_loss * loss_scale["mse_loss_scale"] + 
+                mae_loss * loss_scale["mae_loss_scale"] +
+                lpips_loss * loss_scale["lpips_loss_scale"] + 
+                kl_loss * loss_scale["kl_loss_scale"]
+            )
+        
+        def vae_disc_loss_fn(sample):
+            pred_batch = dec_state.apply_fn(dec_params, sample)
+            return nn.softplus(disc_state.apply_fn(disc_params, pred_batch)).mean() 
         
         # trying to figure out which grad make a dent and gonna rescale it
-        disc_loss_grad, vae_loss_grad = jax.grad(intermediary_loss_fn, argnums=[0,1])(disc_loss, vae_loss)
+        vae_loss_grad = jax.lax.stop_gradient(jax.grad(vae_decode_loss_fn, argnums=[0])(sample)[0].mean())
+        disc_loss_grad = jax.lax.stop_gradient(jax.grad(vae_disc_loss_fn, argnums=[0])(sample)[0].mean())
 
 
         disc_scale = vae_loss_grad / (disc_loss_grad + 1e-6) * loss_scale["toggle_gan"]
@@ -279,7 +294,7 @@ def train(models, batch, loss_scale, train_rng):
         jax.debug.print("vae_grad: {vae_loss_grad}", vae_loss_grad=vae_loss_grad)
         jax.debug.print("gradient_ratio: {disc_scale}", disc_scale=disc_scale)
         
-        vae_loss_final = intermediary_loss_fn(disc_loss * disc_scale, vae_loss)
+        vae_loss_final = disc_loss * disc_scale + vae_loss
 
         vae_loss_stats = {
             "mse_loss": mse_loss * loss_scale["mse_loss_scale"],
@@ -375,10 +390,10 @@ def main():
         "reg_1_scale": 1,
         "toggle_gan": 1
     }
-    GAN_TRAINING_START= 2000
+    GAN_TRAINING_START= 0
     NO_GAN = False
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[0]_mae[1]_disc[0.5]_reg[1]_gan[5k]_imagenet-1k"
+    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[0]_mae[1]_disc[0.5]_reg[1]_gan[0]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
