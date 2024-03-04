@@ -464,7 +464,7 @@ def main():
 
 
                 if i % WANDB_LOG_INTERVAL == 0:
-                    wandb.log(stats)
+                    wandb.log(stats, step=i)
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
                     # progress_bar.set_description(f"{stats_rounded}")
 
@@ -475,7 +475,7 @@ def main():
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
                     create_image_mosaic(preview, 2, len(preview)//2, f"{i}.png")
-                    wandb.log({"image": wandb.Image(f'{i}.png')})
+                    wandb.log({"image": wandb.Image(f'{i}.png')}, step=i)
 
                     ckpt_manager.save(i, models)
 
