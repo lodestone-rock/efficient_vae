@@ -416,7 +416,7 @@ class Decoder(nn.Module):
 class UNetDiscriminator(nn.Module):
     # granular configuration to experiment with
 
-    input_features = 3
+    input_features:int = 3
     down_layer_contraction_factor: Tuple = ((2, 2), (2, 2), (2, 2)) # (h, w) patched input will reduce computation in exchange of accuracy
     down_layer_dim: Tuple = (256, 512, 1024)
     down_layer_kernel_size: Tuple = (7, 7, 7)
@@ -436,10 +436,6 @@ class UNetDiscriminator(nn.Module):
     conv_expansion_factor: int = 4
     eps:float = 1e-6
     group_count: int = 16
-
-    last_layer: str = "linear"
-
-
 
     def setup(self):
         
@@ -568,14 +564,14 @@ class UNetDiscriminator(nn.Module):
             for d_conv_layer in d_conv_layers:
                 image = d_conv_layer(image)
 
-            if i < self.down_blocks - 1:
+            if i < len(self.down_blocks) - 1:
                 skips.append(image)
 
         skips.reverse()
 
         for i, (patch, u_pointwise, u_conv_layers) in enumerate(self.up_blocks):
             if i != 0:
-                image = image + skips[i]
+                image = image + skips[i-1]
             for u_conv_layer in u_conv_layers:
                 image = u_conv_layer(image)
             

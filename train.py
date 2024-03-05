@@ -1,4 +1,5 @@
 import os
+import random
 
 import flax
 import numpy as np
@@ -15,7 +16,7 @@ from tqdm import tqdm
 import wandb
 import jmp
 
-from vae import Decoder, Encoder, Discriminator
+from vae import Decoder, Encoder, Discriminator, UNetDiscriminator
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
 from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn, ImageFolderDataset
 
@@ -74,18 +75,42 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             eps = 1e-6,
             group_count = 16,
         )
-        disc = Discriminator(
-            down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (128, 192, 256, 512, 1024),
-            down_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            down_layer_blocks = (2, 2, 2, 2, 2),
+
+        disc = UNetDiscriminator(
+            input_features = 3,
+            down_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
+            down_layer_dim = (32, 64, 96, 128, 192),
+            down_layer_kernel_size = (3, 3, 3, 3, 3),
+            down_layer_blocks = (2, 2, 2, 2, 1),
             down_layer_ordinary_conv = (False, False, False, False, False),
             down_layer_residual = (True, True, True, True, True),
+
+            output_features = 3,
+            up_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
+            up_layer_dim = (192, 128, 96, 64, 32),
+            up_layer_kernel_size = (3, 3, 3, 3, 3),
+            up_layer_blocks = (1, 2, 2, 2, 2),
+            up_layer_ordinary_conv = (False, False, False, False, False),
+            up_layer_residual = (True, True, True, True, True),
+
             use_bias = False,
             conv_expansion_factor = 4,
             eps = 1e-6,
             group_count = 16,
+
         )
+        # disc = Discriminator(
+        #     down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
+        #     down_layer_dim = (128, 192, 256, 512, 1024),
+        #     down_layer_kernel_size = ( 3, 3, 3, 3, 3),
+        #     down_layer_blocks = (2, 2, 2, 2, 2),
+        #     down_layer_ordinary_conv = (False, False, False, False, False),
+        #     down_layer_residual = (True, True, True, True, True),
+        #     use_bias = False,
+        #     conv_expansion_factor = 4,
+        #     eps = 1e-6,
+        #     group_count = 16,
+        # )
         lpips = LPIPS()
 
         # init model params
@@ -103,6 +128,12 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         # LPIPS VGG16
         lpips_params = lpips.init(lpips_rng, image, image)
 
+        enc_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, enc_params)).values()))
+        dec_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, dec_params)).values()))
+        disc_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, disc_params)).values()))
+        print("encoder param count:", enc_param_count)
+        print("decoder param count:", dec_param_count)
+        print("discriminator param count:", disc_param_count)
         # create callable optimizer chain
         def adam_wrapper(mask):
             constant_scheduler = optax.constant_schedule(learning_rate)
@@ -418,7 +449,7 @@ def train(models, batch, loss_scale, train_rng):
 
 
 def main():
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64
     SEED = 0
     URL_TXT = "datacomp_1b.txt"
     SAVE_MODEL_PATH = "orbax_ckpt"
@@ -430,14 +461,14 @@ def main():
         "mae_loss_scale": 1,
         "lpips_loss_scale": 0.25,
         "kl_loss_scale": 1e-6,
-        "vae_disc_loss_scale": 0.5,
+        "vae_disc_loss_scale": 0.25,
         "reg_1_scale": 1e7,
         "toggle_gan": 1
     }
     GAN_TRAINING_START= 0
     NO_GAN = False
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "testing" # "kl[1e-6]_lpips[0.25]_mse[0]_mae[1]_disc[0.5]_reg[1e7]_gan[2k][trained]_lr[5e-5]_b1[0.5]_b2[0.9]_imagenet-1k"
+    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[0]_mae[1]_disc[0.5]_reg[1e7]_gan[pixel]_lr[5e-5]_b1[0.5]_b2[0.9]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -464,12 +495,37 @@ def main():
     parquet_urls = [parquet_url.strip() for parquet_url in parquet_urls]
     parquet_urls = ["ramdisk/train_images"] * 10
 
+    def rando_colours(IMAGE_RES):
+        
+        max_colour = np.full([1, IMAGE_RES, IMAGE_RES, 1], 255)
+        min_colour = np.zeros((1, IMAGE_RES, IMAGE_RES, 1))
+
+        black = np.concatenate([min_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
+        white = np.concatenate([max_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
+        red = np.concatenate([max_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
+        green = np.concatenate([min_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
+        blue = np.concatenate([min_colour,min_colour,max_colour],axis=-1) / 255 * 2 - 1 
+        magenta = np.concatenate([max_colour,min_colour,max_colour],axis=-1) / 255 * 2 - 1 
+        cyan = np.concatenate([min_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
+        yellow = np.concatenate([max_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
+
+        r = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+        g = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+        b = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+        rando_colour = np.concatenate([r,g,b],axis=-1) / 255 * 2 - 1 
+
+        pallete = [black, white, red, green, blue, magenta, cyan, yellow, rando_colour]
+
+        return random.choice(pallete)
+
+        
+
     STEPS = 0
     _gan_start = 0
     try:
         for parquet_url in parquet_urls:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
-            dataset = ImageFolderDataset(parquet_url, square_size=IMAGE_RES)
+            dataset = ImageFolderDataset(parquet_url, square_size=IMAGE_RES, seed=STEPS)
             t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=1, seed=SEED)
             # Initialize the progress bar
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
@@ -490,6 +546,8 @@ def main():
                     LOSS_SCALE["toggle_gan"] = 0 
 
                 batch = batch / 255 * 2 - 1
+
+                batch[0] = rando_colours(IMAGE_RES)
 
                 batch = jax.tree_map(
                     lambda leaf: jax.device_put(
