@@ -31,10 +31,10 @@ class EfficientConv(nn.Module):
 
     def setup(self):
 
-        self.rms_norm = nn.RMSNorm(
+        self.group_norm = nn.GroupNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
-            param_dtype=jnp.float32
+            param_dtype=jnp.float32,
         )
         # using classical conv on early layer will increase flops but make it faster to train 
         if self.classic_conv:
@@ -75,7 +75,7 @@ class EfficientConv(nn.Module):
         # store input as residual identity
         if self.residual:
             residual = x
-        x = self.rms_norm(x)
+        x = self.group_norm(x)
         # use conv for early layer if possible
         if self.classic_conv:
             x = self.conv(x) 
@@ -133,7 +133,51 @@ class SelfAttention(nn.Module):
         return x
 
 
- 
+class Upsample(nn.Module):
+
+    features: int
+    use_bias: False
+
+    def setup(self):
+        self.conv = nn.Conv(
+            self.features,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            use_bias=self.use_bias
+        )
+
+    def __call__(self, x):
+        batch, height, width, channels = x.shape
+        x = jax.image.resize(
+            x,
+            shape=(batch, height * 2, width * 2, channels),
+            method="nearest",
+        )
+        x = self.conv(x)
+        return x
+
+class Downsample(nn.Module):
+
+    features: int
+    use_bias: False
+
+    def setup(self):
+        self.conv = nn.Conv(
+            self.features,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            use_bias=self.use_bias
+        )
+
+    def __call__(self, x):
+        pad = ((0, 0), (0, 1), (0, 1), (0, 0))
+        x = jnp.pad(x, pad_width=pad)
+        x = self.conv(x)
+        return x
+
+
 class Encoder(nn.Module):
     # granular configuration to experiment with
     input_features = 3
@@ -144,7 +188,7 @@ class Encoder(nn.Module):
     down_layer_ordinary_conv: Tuple = (False, False, False) # convert block to ordinary conv
     down_layer_residual: Tuple = (True, True, True) # toggle it off just for fun :P https://arxiv.org/abs/2108.08810
     use_bias: bool = False 
-    conv_expansion_factor: int = 4
+    conv_expansion_factor: Tuple = (2, 2, 2)
     eps:float = 1e-6
     group_count: int = 16
     last_layer: str = "linear"
@@ -169,7 +213,11 @@ class Encoder(nn.Module):
         for stage, layer_count in enumerate(self.down_layer_blocks):
             # TODO: add a way to disable this projection so the identity path is uninterrupted
             # projection layer (pointwise conv) 
-            input_proj = nn.Dense(
+            # input_proj = nn.Dense(
+            #     features=self.down_layer_dim[stage],
+            #     use_bias=self.use_bias,
+            # )
+            input_proj = Downsample(
                 features=self.down_layer_dim[stage],
                 use_bias=self.use_bias,
             )
@@ -180,7 +228,7 @@ class Encoder(nn.Module):
                 down_layer = EfficientConv(
                     features=self.down_layer_dim[stage],
                     kernel_size=self.down_layer_kernel_size[stage],
-                    expansion_factor=self.conv_expansion_factor,
+                    expansion_factor=self.conv_expansion_factor[stage],
                     group_count=self.group_count,
                     use_bias=self.use_bias,
                     eps=self.eps,
@@ -209,28 +257,28 @@ class Encoder(nn.Module):
         elif self.last_layer == "linear":
             self.projections = nn.Dense(
                 features=self.down_layer_dim[-1] * 2,
-                use_bias=self.use_bias,
+                use_bias=True,
             )
-        self.final_norm = nn.RMSNorm(
+        self.final_norm = nn.GroupNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
-            param_dtype=jnp.float32
+            param_dtype=jnp.float32,
         )
 
         self.input_conv = nn.Conv(
-            features=self.input_features,
+            features=self.down_layer_dim[0],
             kernel_size=(3, 3), 
             strides=(1, 1),
             padding="SAME",
             feature_group_count=1,
-            use_bias=self.use_bias,
+            use_bias=True,
         )
 
     def __call__(self, image):
 
         image = self.input_conv(image)
         for patch, pointwise, conv_layers in self.blocks:
-            image = space_to_depth(image, h=patch[0], w=patch[1]) 
+            # image = space_to_depth(image, h=patch[0], w=patch[1]) 
             image = pointwise(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
@@ -250,7 +298,7 @@ class Discriminator(nn.Module):
     down_layer_ordinary_conv: Tuple = (False, False, False) # convert block to ordinary conv
     down_layer_residual: Tuple = (True, True, True) # toggle it off just for fun :P https://arxiv.org/abs/2108.08810
     use_bias: bool = False 
-    conv_expansion_factor: int = 4
+    conv_expansion_factor: Tuple = (2, 2, 2)
     eps:float = 1e-6
     group_count: int = 16
 
@@ -273,7 +321,11 @@ class Discriminator(nn.Module):
         for stage, layer_count in enumerate(self.down_layer_blocks):
             # TODO: add a way to disable this projection so the identity path is uninterrupted
             # projection layer (pointwise conv) 
-            input_proj = nn.Dense(
+            # input_proj = nn.Dense(
+            #     features=self.down_layer_dim[stage],
+            #     use_bias=self.use_bias,
+            # )
+            input_proj = Downsample(
                 features=self.down_layer_dim[stage],
                 use_bias=self.use_bias,
             )
@@ -284,7 +336,7 @@ class Discriminator(nn.Module):
                 down_layer = EfficientConv(
                     features=self.down_layer_dim[stage],
                     kernel_size=self.down_layer_kernel_size[stage],
-                    expansion_factor=self.conv_expansion_factor,
+                    expansion_factor=self.conv_expansion_factor[stage],
                     group_count=self.group_count,
                     use_bias=self.use_bias,
                     eps=self.eps,
@@ -296,7 +348,7 @@ class Discriminator(nn.Module):
             down_blocks.append(down_layers)
 
         self.blocks = list(zip(self.down_layer_contraction_factor, down_projections, down_blocks))
-        self.final_norm = nn.RMSNorm(
+        self.final_norm = nn.GroupNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
             param_dtype=jnp.float32
@@ -306,11 +358,21 @@ class Discriminator(nn.Module):
                 use_bias=self.use_bias,
             )
 
+        self.input_conv = nn.Conv(
+            features=self.down_layer_dim[0],
+            kernel_size=(3, 3), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=1,
+            use_bias=True,
+        )
+
 
     def __call__(self, image):
 
+        image = self.input_conv(image)
         for patch, pointwise, conv_layers in self.blocks:
-            image = space_to_depth(image, h=patch[0], w=patch[1]) 
+            # image = space_to_depth(image, h=patch[0], w=patch[1]) 
             image = pointwise(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
@@ -330,7 +392,7 @@ class Decoder(nn.Module):
     up_layer_ordinary_conv: Tuple = (False, False, False) # convert block to ordinary conv
     up_layer_residual: Tuple = (True, True, True) # toggle it off just for fun :P https://arxiv.org/abs/2108.08810
     use_bias: bool = False 
-    conv_expansion_factor: int = 4
+    conv_expansion_factor: Tuple = (2, 2, 2)
     eps:float = 1e-6
     group_count: int = 16
 
@@ -357,7 +419,7 @@ class Decoder(nn.Module):
                 up_layer = EfficientConv(
                     features=self.up_layer_dim[stage],
                     kernel_size=self.up_layer_kernel_size[stage],
-                    expansion_factor=self.conv_expansion_factor,
+                    expansion_factor=self.conv_expansion_factor[stage],
                     group_count=self.group_count,
                     use_bias=self.use_bias,
                     eps=self.eps,
@@ -371,24 +433,34 @@ class Decoder(nn.Module):
             # TODO: add a way to disable this projection so the identity path is uninterrupted
             # projection layer (pointwise conv) 
             if stage + 1 == len(self.up_layer_blocks):
-                 output_proj = nn.Dense(
-                    features=self.output_features * self.up_layer_contraction_factor[stage][0] * self.up_layer_contraction_factor[stage][1],
+                # output_proj = nn.Dense(
+                #     features=self.output_features * self.up_layer_contraction_factor[stage][0] * self.up_layer_contraction_factor[stage][1],
+                #     use_bias=self.use_bias,
+                # )
+                output_proj = Upsample(
+                    features=self.up_layer_dim[-1],
                     use_bias=self.use_bias,
                 )
             else:
-                output_proj = nn.Dense(
-                    features=self.up_layer_dim[stage + 1] * (
-                        self.up_layer_contraction_factor[stage][0] * self.up_layer_contraction_factor[stage][1]),
+                # output_proj = nn.Dense(
+                #     features=self.up_layer_dim[stage + 1] * (
+                #         self.up_layer_contraction_factor[stage][0] * self.up_layer_contraction_factor[stage][1]),
+                #     use_bias=self.use_bias,
+                # )
+
+                output_proj = Upsample(
+                    features=self.up_layer_dim[stage + 1],
                     use_bias=self.use_bias,
                 )
             up_projections.append(output_proj)
             
 
         self.blocks = list(zip(self.up_layer_contraction_factor, up_projections, up_blocks))
-        self.final_norm = nn.RMSNorm(
+        self.final_norm = nn.GroupNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
-            param_dtype=jnp.float32
+            param_dtype=jnp.float32,
+            num_groups=1
         )
         self.final_conv = nn.Conv(
             features=self.output_features,
@@ -396,17 +468,22 @@ class Decoder(nn.Module):
             strides=(1, 1),
             padding="SAME",
             feature_group_count=1,
-            use_bias=self.use_bias,
+            use_bias=True,
+        )
+        self.projections = nn.Dense(
+            features=self.up_layer_dim[0],
+            use_bias=True,
         )
 
     def __call__(self, image):
 
+        image = self.projections(image)
         for i, (patch, pointwise, conv_layers) in enumerate(self.blocks):
             for conv_layer in conv_layers:
                 image = conv_layer(image)
             
             image = pointwise(image)
-            image = depth_to_space(image, h=patch[0], w=patch[1]) 
+            # image = depth_to_space(image, h=patch[0], w=patch[1]) 
         image = self.final_norm(image)
         image = nn.silu(image)
         image = self.final_conv(image)
@@ -539,7 +616,7 @@ class UNetDiscriminator(nn.Module):
 
         self.up_blocks = list(zip(self.up_layer_contraction_factor, up_projections, up_blocks))
 
-        self.final_norm = nn.RMSNorm(
+        self.final_norm = nn.GroupNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
             param_dtype=jnp.float32

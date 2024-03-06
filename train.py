@@ -51,66 +51,66 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
 
         enc = Encoder(
             down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (128, 192, 256, 512, 1024),
+            down_layer_dim = (128, 256, 512, 512, 1024),
             down_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            down_layer_blocks = (2, 2, 2, 2, 1),
-            down_layer_ordinary_conv = (False, False, False, False, False),
+            down_layer_blocks = (4, 4, 4, 4, 2),
+            down_layer_ordinary_conv = (True, True, True, True, False),
             down_layer_residual = (True, True, True, True, True),
             use_bias = False,
-            conv_expansion_factor = 4,
+            conv_expansion_factor = (1, 1, 1, 1, 2),
             eps = 1e-6,
             group_count = 16,
-            last_layer = "conv",
+            last_layer = "linear",
         )
         dec = Decoder(
             output_features = 3,
             up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (1024, 512, 256, 192, 128),
+            up_layer_dim = (1024, 512, 512, 256, 128),
             up_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            up_layer_blocks = (2, 2, 2, 2, 2),
-            up_layer_ordinary_conv = (False, False, False, False, False),
+            up_layer_blocks = (2, 4, 4, 4, 4),
+            up_layer_ordinary_conv = (False, True, True, True, True),
             up_layer_residual = (True, True, True, True, True),
-            use_bias = False,
-            conv_expansion_factor = 4,
+            use_bias = True,
+            conv_expansion_factor = (2, 1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
         )
 
-        disc = UNetDiscriminator(
-            input_features = 3,
-            down_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (32, 64, 96, 128, 192),
-            down_layer_kernel_size = (3, 3, 3, 3, 3),
-            down_layer_blocks = (2, 2, 2, 2, 1),
-            down_layer_ordinary_conv = (False, False, False, False, False),
-            down_layer_residual = (True, True, True, True, True),
-
-            output_features = 3,
-            up_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (192, 128, 96, 64, 32),
-            up_layer_kernel_size = (3, 3, 3, 3, 3),
-            up_layer_blocks = (1, 2, 2, 2, 2),
-            up_layer_ordinary_conv = (False, False, False, False, False),
-            up_layer_residual = (True, True, True, True, True),
-
-            use_bias = False,
-            conv_expansion_factor = 4,
-            eps = 1e-6,
-            group_count = 16,
-
-        )
-        # disc = Discriminator(
-        #     down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-        #     down_layer_dim = (128, 192, 256, 512, 1024),
-        #     down_layer_kernel_size = ( 3, 3, 3, 3, 3),
-        #     down_layer_blocks = (2, 2, 2, 2, 2),
+        # disc = UNetDiscriminator(
+        #     input_features = 3,
+        #     down_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
+        #     down_layer_dim = (32, 64, 96, 128, 192),
+        #     down_layer_kernel_size = (3, 3, 3, 3, 3),
+        #     down_layer_blocks = (2, 2, 2, 2, 1),
         #     down_layer_ordinary_conv = (False, False, False, False, False),
         #     down_layer_residual = (True, True, True, True, True),
+
+        #     output_features = 3,
+        #     up_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
+        #     up_layer_dim = (192, 128, 96, 64, 32),
+        #     up_layer_kernel_size = (3, 3, 3, 3, 3),
+        #     up_layer_blocks = (1, 2, 2, 2, 2),
+        #     up_layer_ordinary_conv = (False, False, False, False, False),
+        #     up_layer_residual = (True, True, True, True, True),
+
         #     use_bias = False,
         #     conv_expansion_factor = 4,
         #     eps = 1e-6,
         #     group_count = 16,
+
         # )
+        disc = Discriminator(
+            down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
+            down_layer_dim = (128, 256, 512, 512, 1024),
+            down_layer_kernel_size = ( 3, 3, 3, 3, 3),
+            down_layer_blocks = (2, 2, 2, 2, 2),
+            down_layer_ordinary_conv = (True, True, True, True, False),
+            down_layer_residual = (True, True, True, True, True),
+            use_bias = False,
+            conv_expansion_factor = (1, 1, 1, 1, 2),
+            eps = 1e-6,
+            group_count = 16,
+        )
         lpips = LPIPS()
 
         # init model params
@@ -157,7 +157,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             apply_fn=enc.apply,
             params=enc_params,
             tx=adam_wrapper(
-                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale", enc_params)
+                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", enc_params)
             ),
         )
         # trained
@@ -165,7 +165,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             apply_fn=dec.apply,
             params=dec_params,
             tx=adam_wrapper(
-                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale", dec_params)
+                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", dec_params)
             ),
         )
         # trained
@@ -173,7 +173,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             apply_fn=disc.apply,
             params=disc_params,
             tx=adam_wrapper(
-                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale", disc_params)
+                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", disc_params)
             ),
         )
         # frozen
@@ -454,22 +454,22 @@ def main():
     URL_TXT = "datacomp_1b.txt"
     SAVE_MODEL_PATH = "orbax_ckpt"
     IMAGE_RES = 256
-    SAVE_EVERY = 500
-    LEARNING_RATE = 5e-5
+    SAVE_EVERY = 2500
+    LEARNING_RATE = 1e-5
     LOSS_SCALE = {
-        "mse_loss_scale": 0.0,
-        "mae_loss_scale": 1,
+        "mse_loss_scale": 1,
+        "mae_loss_scale": 0,
         "lpips_loss_scale": 0.25,
         "kl_loss_scale": 1e-6,
-        "vae_disc_loss_scale": 0.25,
+        "vae_disc_loss_scale": 0.5,
         "reg_1_scale": 1e7,
         "toggle_gan": 1
     }
     GAN_TRAINING_START= 0
     NO_GAN = False
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[0]_mae[1]_disc[0.5]_reg[1e7]_gan[pixel]_lr[5e-5]_b1[0.5]_b2[0.9]_imagenet-1k"
-    WANDB_LOG_INTERVAL = 100
+    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_disc[0.5]_reg[1e7]_gan[global]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_imagenet-1k"
+    WANDB_LOG_INTERVAL = 500
 
     # wandb logging
     if WANDB_PROJECT_NAME:
@@ -514,7 +514,9 @@ def main():
         b = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
         rando_colour = np.concatenate([r,g,b],axis=-1) / 255 * 2 - 1 
 
-        pallete = [black, white, red, green, blue, magenta, cyan, yellow, rando_colour]
+
+        absolute = [black, white] * 4
+        pallete = [red, green, blue, magenta, cyan, yellow, rando_colour] + absolute
 
         return random.choice(pallete)
 
@@ -526,7 +528,7 @@ def main():
         for parquet_url in parquet_urls:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
             dataset = ImageFolderDataset(parquet_url, square_size=IMAGE_RES, seed=STEPS)
-            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=1, seed=SEED)
+            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=3, seed=SEED)
             # Initialize the progress bar
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
@@ -566,6 +568,10 @@ def main():
                 if i % WANDB_LOG_INTERVAL == 0:
                     wandb.log(stats, step=STEPS)
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
+                    preview = jnp.concatenate([batch[:4], output[:4]], axis = 0)
+                    preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
+
+                    create_image_mosaic(preview, 2, len(preview)//2, f"{STEPS}.png")
                     # progress_bar.set_description(f"{stats_rounded}")
 
 
