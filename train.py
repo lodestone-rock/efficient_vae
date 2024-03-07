@@ -50,6 +50,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         enc_rng, dec_rng, disc_rng, lpips_rng = jax.random.split(jax.random.PRNGKey(seed), 4)
 
         enc = Encoder(
+            output_features = 768,
             down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
             down_layer_dim = (128, 256, 512, 512, 1024),
             down_layer_kernel_size = ( 3, 3, 3, 3, 3),
@@ -449,27 +450,27 @@ def train(models, batch, loss_scale, train_rng):
 
 
 def main():
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
     SEED = 0
     URL_TXT = "datacomp_1b.txt"
     SAVE_MODEL_PATH = "orbax_ckpt"
     IMAGE_RES = 256
-    SAVE_EVERY = 2500
-    LEARNING_RATE = 1e-5
+    SAVE_EVERY = 500
+    LEARNING_RATE = 1e-4
     LOSS_SCALE = {
         "mse_loss_scale": 1,
         "mae_loss_scale": 0,
         "lpips_loss_scale": 0.25,
         "kl_loss_scale": 1e-6,
-        "vae_disc_loss_scale": 0.5,
-        "reg_1_scale": 1e7,
-        "toggle_gan": 1
+        "vae_disc_loss_scale": 0.0,
+        "reg_1_scale": 0,
+        "toggle_gan": 0
     }
     GAN_TRAINING_START= 0
-    NO_GAN = False
+    NO_GAN = True
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_disc[0.5]_reg[1e7]_gan[global]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_imagenet-1k"
-    WANDB_LOG_INTERVAL = 500
+    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
+    WANDB_LOG_INTERVAL = 100
 
     # wandb logging
     if WANDB_PROJECT_NAME:
@@ -543,7 +544,9 @@ def main():
 
                 if _gan_start > GAN_TRAINING_START:
                     print("GAN TRAINING MODE START NOW")
-                    LOSS_SCALE["toggle_gan"] = 1
+                    LEARNING_RATE = 1e-6
+                    if LOSS_SCALE["toggle_gan"] < 1:
+                        LOSS_SCALE["toggle_gan"] += 0.00001
                 else:
                     LOSS_SCALE["toggle_gan"] = 0 
 
@@ -568,7 +571,7 @@ def main():
                 if i % WANDB_LOG_INTERVAL == 0:
                     wandb.log(stats, step=STEPS)
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
-                    preview = jnp.concatenate([batch[:4], output[:4]], axis = 0)
+                    preview = jnp.concatenate([batch[:4], np.clip(output[:4], -1, 1)], axis = 0)
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
                     create_image_mosaic(preview, 2, len(preview)//2, f"{STEPS}.png")

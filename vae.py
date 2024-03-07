@@ -180,7 +180,7 @@ class Downsample(nn.Module):
 
 class Encoder(nn.Module):
     # granular configuration to experiment with
-    input_features = 3
+    output_features: int = 3
     down_layer_contraction_factor: Tuple = ((2, 2), (2, 2), (2, 2)) # (h, w) patched input will reduce computation in exchange of accuracy
     down_layer_dim: Tuple = (256, 512, 1024)
     down_layer_kernel_size: Tuple = (7, 7, 7)
@@ -243,20 +243,17 @@ class Encoder(nn.Module):
 
         # cant decide which is which so gonna put it in the config
         if self.last_layer == "conv":
-            self.projections = EfficientConv(
-                features=self.down_layer_dim[-1] * 2,
-                kernel_size=self.down_layer_kernel_size[-1],
-                expansion_factor=self.conv_expansion_factor,
-                group_count=self.group_count,
-                use_bias=self.use_bias,
-                eps=self.eps,
-                classic_conv=self.down_layer_ordinary_conv[-1],
-                residual=False,
-            )
-
+            self.projections = nn.Conv(
+                features=self.output_features * 2,
+                kernel_size=(3, 3), 
+                strides=(1, 1),
+                padding="SAME",
+                feature_group_count=1,
+                use_bias=True,
+        )
         elif self.last_layer == "linear":
             self.projections = nn.Dense(
-                features=self.down_layer_dim[-1] * 2,
+                features=self.output_features * 2,
                 use_bias=True,
             )
         self.final_norm = nn.GroupNorm(
@@ -283,8 +280,8 @@ class Encoder(nn.Module):
             for conv_layer in conv_layers:
                 image = conv_layer(image)
         image = self.final_norm(image)
-        image = nn.silu(image)
         image = self.projections(image)
+        image = nn.tanh(image)
         return image
 
 
@@ -485,8 +482,8 @@ class Decoder(nn.Module):
             image = pointwise(image)
             # image = depth_to_space(image, h=patch[0], w=patch[1]) 
         image = self.final_norm(image)
-        image = nn.silu(image)
         image = self.final_conv(image)
+        image = nn.tanh(image)
 
         return image
 
