@@ -5,6 +5,7 @@ init.sh
 scratchboard.py
 __pycache__
 /orbax_ckpt*
+/*ckpt
 /wandb
 init.sh
 /.vscode
@@ -13,3 +14,5 @@ init.sh
 /ramdisk
 *.JPEG
 /jax_cache
+*.json
+*.jpg

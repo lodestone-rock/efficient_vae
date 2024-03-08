@@ -15,6 +15,7 @@ import orbax.checkpoint
 from tqdm import tqdm
 import wandb
 import jmp
+import cv2
 
 from vae import Decoder, Encoder, Discriminator, UNetDiscriminator
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
@@ -448,15 +449,27 @@ def train(models, batch, loss_scale, train_rng):
 
     return new_models_state, new_train_rng, pred_batch, {**disc_loss_stats, **vae_loss_stats, **loss_stats}
 
+@jax.jit
+def inference(models, batch):
+    enc_state, dec_state, _ = models
+
+    enc_params, dec_params, batch = mixed_precision_policy.cast_to_compute((enc_state.params, dec_state.params, batch))
+    latents = enc_state.apply_fn(enc_params, batch)
+    # encoder is learning logvar instead of std 
+    latent_mean, latent_logvar = rearrange(latents, "b h w (c split) -> split b h w c", split = 2)
+    # reparameterization using logvar
+    sample = latent_mean + jnp.exp(0.5 * latent_logvar) * jax.random.normal(jax.random.PRNGKey(0), latent_mean.shape)
+
+    return dec_state.apply_fn(dec_params, sample)
 
 def main():
     BATCH_SIZE = 128
     SEED = 0
     URL_TXT = "datacomp_1b.txt"
-    SAVE_MODEL_PATH = "orbax_ckpt"
+    SAVE_MODEL_PATH = "vae_ckpt"
     IMAGE_RES = 256
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 2e-4
     LOSS_SCALE = {
         "mse_loss_scale": 1,
         "mae_loss_scale": 0,
@@ -469,7 +482,7 @@ def main():
     GAN_TRAINING_START= 0
     NO_GAN = True
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
+    WANDB_RUN_NAME = "final"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -521,7 +534,7 @@ def main():
 
         return random.choice(pallete)
 
-        
+    sample_image = np.concatenate([cv2.imread(f"sample_{x}.jpg")[None, ...] for x in range(4)] * int(BATCH_SIZE//4), axis=0) / 255 * 2 - 1
 
     STEPS = 0
     _gan_start = 0
@@ -571,22 +584,25 @@ def main():
                 if i % WANDB_LOG_INTERVAL == 0:
                     wandb.log(stats, step=STEPS)
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
-                    preview = jnp.concatenate([batch[:4], np.clip(output[:4], -1, 1)], axis = 0)
+
+                    preview_test = inference(models, sample_image)
+                    preview = jnp.concatenate([batch[:4], output[:4], preview_test[:4]], axis = 0)
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                    create_image_mosaic(preview, 2, len(preview)//2, f"{STEPS}.png")
+                    create_image_mosaic(preview, 3, len(preview)//3, f"{STEPS}.png")
                     # progress_bar.set_description(f"{stats_rounded}")
 
 
                 # save every n steps
                 if i % SAVE_EVERY == 0:
-                    preview = jnp.concatenate([batch[:4], output[:4]], axis = 0)
+                    preview_test = inference(models, sample_image)
+                    preview = jnp.concatenate([batch[:4], output[:4], preview_test[:4]], axis = 0)
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                    create_image_mosaic(preview, 2, len(preview)//2, f"{STEPS}.png")
+                    create_image_mosaic(preview, 3, len(preview)//3, f"{STEPS}.png")
                     wandb.log({"image": wandb.Image(f'{STEPS}.png')}, step=STEPS)
 
-                    ckpt_manager.save(i, models)
+                    ckpt_manager.save(STEPS, models)
 
 
                 progress_bar.update(1)
