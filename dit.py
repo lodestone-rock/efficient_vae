@@ -27,7 +27,7 @@ def create_2d_sinusoidal_positions_fn(width_len=8, height_len=8, dim=768, max_fr
         if max_freq is None:
             max_freq = height_len / 2 if height_len < width_len else width_len / 2
 
-        freqs = jnp.linspace(epsilon, max_freq, height_len)
+        freqs = jnp.linspace(epsilon, max_freq, dim)
 
         # stack of position embedding for each dim
         sinusoidal_2d = []
@@ -44,7 +44,8 @@ def create_2d_sinusoidal_positions_fn(width_len=8, height_len=8, dim=768, max_fr
             # rescale it
             compound = (compound- compound.min())/(compound.max()-compound.min())
             sinusoidal_2d.append(compound)
-
+        
+        sinusoidal_2d = jnp.stack(sinusoidal_2d, axis=-1)
         return sinusoidal_2d
 
 
@@ -69,6 +70,7 @@ class SelfAttention(nn.Module):
     use_bias: bool = False # removing bias won't affect the model much
     eps:float = 1e-6
     embed_dim: int = 768
+    use_flash_attention: bool = False
 
     def setup(self):
 
@@ -105,10 +107,15 @@ class SelfAttention(nn.Module):
         k = rearrange(k, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
         # [batch_size, num_heads, kv_seq_len, d_model]
         v = rearrange(v, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
-        # use pallas flash attention kernel
-        out = flash_attention(q,k,v)
+        if self.use_flash_attention:
+            # use pallas flash attention kernel
+            # https://github.com/google/jax/issues/18590#issuecomment-1830671863
+            # turns out no need to use this since we're dealing with seq length smaller than 4096
+            out = flash_attention(q,k,v)
+        else:
+            out = nn.dot_product_attention(q,k,v)
         # output projection
-        x = self.out(x)
+        x = self.out(out)
         return  x + residual
     
 
@@ -142,8 +149,12 @@ class DiTBLock(nn.Module):
     n_time_embed_layers: int = 3
     time_embed_expansion_factor: int = 2
     diffusion_timesteps: int = 1000
+    use_flash_attention: bool = False
 
     def setup(self):
+
+        if self.use_flash_attention:
+            raise Exception("not supported yet! still have to figure out padding shape")
 
         # time embed lut
         self.time_embed = nn.Embed(
@@ -159,7 +170,8 @@ class DiTBLock(nn.Module):
                 expansion_factor=self.attn_expansion_factor, 
                 use_bias=self.use_bias, 
                 eps=self.eps,
-                embed_dim=self.embed_dim
+                embed_dim=self.embed_dim,
+                use_flash_attention=self.use_flash_attention
             )
             glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias)
 
@@ -173,7 +185,7 @@ class DiTBLock(nn.Module):
             # overkill but eh whatever
             glu_time = GLU(embed_dim=self.embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias)
 
-            time_embedding_stack.append([glu_time])
+            time_embedding_stack.append(glu_time)
         self.time_embedding_stack = time_embedding_stack
         
     def create_2d_sinusoidal_pos(self, width_len=8, height_len=8):
@@ -200,6 +212,7 @@ class DiTBLock(nn.Module):
         # NOTE: flax uses NHWC convention so the entire ops is in NHWC
         # merge height and weight and treat it as a token sequence
         # NHWC => BLD 
+        n, h, w, c = x.shape
         x = x + image_pos
         x = rearrange(x, "n h w c-> n (h w) c")
         # time loop 
@@ -209,12 +222,21 @@ class DiTBLock(nn.Module):
 
         # TODO: add rope
 
-        x = jnp.concatenate([time, x], axis=-2) # put time embedding in the seq dim
+        x = jnp.concatenate([time[:,None,:], x], axis=-2) # put time embedding in the seq dim
+
         # attention block loop
         for attn, glu in self.dit_blocks:
             x = attn(x, extra_pos) # NOTE: if using this pos put image token in 1 position!
             x = glu(x)
         
         x = x[:,1:,:] # pop time embedding
-        x = rearrange(x, "n (c h) w -> n c h w")
+        x = rearrange(x, "n (h w) c -> n h w c", h=h)
         return x
+
+# model = DiTBLock(n_layers=3, embed_dim=10, n_heads=2, use_flash_attention=False)
+
+# img = jnp.ones((128,16,16,10))
+# img_pos = model.create_2d_sinusoidal_pos(16,16)
+# timesteps = jnp.ones([128]).astype(jnp.int32)
+# model_params = model.init(jax.random.PRNGKey(2), img, img_pos, timesteps)
+# print()
