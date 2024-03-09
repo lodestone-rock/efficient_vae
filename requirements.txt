@@ -10,4 +10,5 @@ lpips-j
 orbax
 tqdm
 wandb
+diffusers
 # manually install jax!

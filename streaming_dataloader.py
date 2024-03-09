@@ -166,6 +166,65 @@ class ImageFolderDataset():
             return self.__getitem__(random.randrange(0, len(self.file_list)))
         
         return image
+
+
+class SquareImageDataset():
+    def __init__(self, root_dir, square_size=50, seed=84):
+        self.root_dir = root_dir
+        self.file_list = os.listdir(root_dir)
+        self.square_size = square_size
+        random.seed(seed)
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        try:
+            img_name = os.path.join(self.root_dir, self.file_list[idx])
+            image = cv2.imread(img_name)
+            if image.shape[-1] != 3:
+                raise "image has more than 3 channel"
+            # Calculate the dimensions for center crop
+            height, width = image.shape[:2]
+            crop_size = min(height, width)
+            top = (height - crop_size) // 2
+            left = (width - crop_size) // 2
+            bottom = top + crop_size
+            right = left + crop_size
+
+            # Perform center crop using NumPy array slicing
+            image = image[top:bottom, left:right]
+            image = cv2.resize(image, (self.square_size, self.square_size), interpolation=cv2.INTER_AREA)
+
+        except Exception as e:
+            return self.__getitem__(random.randrange(0, len(self.file_list)))
+        
+        return image
+
+def rando_colours(IMAGE_RES):
+    
+    max_colour = np.full([1, IMAGE_RES, IMAGE_RES, 1], 255)
+    min_colour = np.zeros((1, IMAGE_RES, IMAGE_RES, 1))
+
+    black = np.concatenate([min_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
+    white = np.concatenate([max_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    red = np.concatenate([max_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
+    green = np.concatenate([min_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
+    blue = np.concatenate([min_colour,min_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    magenta = np.concatenate([max_colour,min_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    cyan = np.concatenate([min_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    yellow = np.concatenate([max_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
+
+    r = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    g = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    b = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    rando_colour = np.concatenate([r,g,b],axis=-1) / 255 * 2 - 1 
+
+
+    absolute = [black, white] * 4
+    pallete = [red, green, blue, magenta, cyan, yellow, rando_colour] + absolute
+
+    return random.choice(pallete)
     
 
 # collate function here is to fill the gap due to lossy retrieval by simply filling the gap with random rotation of random sample

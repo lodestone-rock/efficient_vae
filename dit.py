@@ -101,21 +101,31 @@ class SelfAttention(nn.Module):
         if pos is not None:
             q = apply_rotary_pos_emb(q, pos)
             k = apply_rotary_pos_emb(k, pos)
-        # [batch_size, num_heads, q_seq_len, d_model]
-        q = rearrange(q, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
-        # [batch_size, num_heads, kv_seq_len, d_model]
-        k = rearrange(k, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
-        # [batch_size, num_heads, kv_seq_len, d_model]
-        v = rearrange(v, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
         if self.use_flash_attention:
+            # [batch_size, num_heads, q_seq_len, d_model]
+            q = rearrange(q, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
+            # [batch_size, num_heads, kv_seq_len, d_model]
+            k = rearrange(k, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
+            # [batch_size, num_heads, kv_seq_len, d_model]
+            v = rearrange(v, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
             # use pallas flash attention kernel
             # https://github.com/google/jax/issues/18590#issuecomment-1830671863
             # turns out no need to use this since we're dealing with seq length smaller than 4096
             out = flash_attention(q,k,v)
+            # output projection
+            out = rearrange(out, "b n_head l d -> b l (n_head d)")
         else:
+            # [batch_size, num_heads, q_seq_len, d_model]
+            q = rearrange(q, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+            # [batch_size, num_heads, kv_seq_len, d_model]
+            k = rearrange(k, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+            # [batch_size, num_heads, kv_seq_len, d_model]
+            v = rearrange(v, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
             out = nn.dot_product_attention(q,k,v)
-        # output projection
+            # output projection
+            out = rearrange(out, "b l n_head d -> b l (n_head d)")
         x = self.out(out)
+
         return  x + residual
     
 
@@ -150,9 +160,13 @@ class DiTBLock(nn.Module):
     time_embed_expansion_factor: int = 2
     diffusion_timesteps: int = 1000
     use_flash_attention: bool = False
+    n_class: int = 1000
+    latent_size: int = 8
 
     def setup(self):
-
+        
+        if self.latent_size is not None:
+            self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size, self.latent_size)
         if self.use_flash_attention:
             raise Exception("not supported yet! still have to figure out padding shape")
 
@@ -161,6 +175,12 @@ class DiTBLock(nn.Module):
             self.diffusion_timesteps, 
             features=self.embed_dim
         )
+        # class embed just an ordinary lookup table
+        if self.n_class is not None:
+            self.class_embed = nn.Embed(
+                self.n_class, 
+                features=self.embed_dim
+            )
 
         # transformers
         dit_blocks = []
@@ -208,35 +228,51 @@ class DiTBLock(nn.Module):
         return pos
 
 
-    def __call__(self, x, image_pos, timestep, extra_pos=None):
+    def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None):
         # NOTE: flax uses NHWC convention so the entire ops is in NHWC
         # merge height and weight and treat it as a token sequence
         # NHWC => BLD 
         n, h, w, c = x.shape
-        x = x + image_pos
+
+        # use default image position latent if not provided
+        if self.latent_size is not None:
+            x = x + self.latent_positional_embedding
+        else:
+            x = x + image_pos
         x = rearrange(x, "n h w c-> n (h w) c")
         # time loop 
         time = self.time_embed(timestep) # grab the time
+        if self.n_class is not None:
+            class_cond = self.class_embed(cond)
+        # mebbe ditching this loop is simpler 
+        # simple time embedding vector should suffice
+        # silly ideas, rescale the input vector relative to this 
+        # so the model pay more attention to the timesteps or class
         for glu_time in self.time_embedding_stack:
             time = glu_time(time)
 
         # TODO: add rope
 
-        x = jnp.concatenate([time[:,None,:], x], axis=-2) # put time embedding in the seq dim
-
+        if self.n_class is not None:
+            x = jnp.concatenate([time[:,None,:], class_cond[:,None,:], x], axis=-2) # put time embedding in the seq dim
+        else:
+            x = jnp.concatenate([time[:,None,:], x], axis=-2) # put time embedding in the seq dim
         # attention block loop
         for attn, glu in self.dit_blocks:
             x = attn(x, extra_pos) # NOTE: if using this pos put image token in 1 position!
             x = glu(x)
-        
-        x = x[:,1:,:] # pop time embedding
+        if self.n_class is not None:
+            x = x[:,2:,:] # pop time and class embedding
+        else:
+            x = x[:,1:,:] # pop time embedding
         x = rearrange(x, "n (h w) c -> n h w c", h=h)
         return x
 
-# model = DiTBLock(n_layers=3, embed_dim=10, n_heads=2, use_flash_attention=False)
+# model = DiTBLock(n_layers=3, embed_dim=10, n_heads=2, use_flash_attention=False, latent_size=8)
 
-# img = jnp.ones((128,16,16,10))
+# img = jnp.ones((128,8,8,10))
 # img_pos = model.create_2d_sinusoidal_pos(16,16)
 # timesteps = jnp.ones([128]).astype(jnp.int32)
-# model_params = model.init(jax.random.PRNGKey(2), img, img_pos, timesteps)
+# cond = jnp.ones([128]).astype(jnp.int32)
+# model_params = model.init(jax.random.PRNGKey(2), img, cond, timesteps)
 # print()
