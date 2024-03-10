@@ -4,6 +4,8 @@ import random
 import flax
 import numpy as np
 import jax
+from jax import config
+# config.update("jax_debug_nans", True)
 from jax.experimental.compilation_cache import compilation_cache as cc
 import jax.numpy as jnp
 from einops import rearrange
@@ -16,11 +18,12 @@ import wandb
 import jmp
 import cv2
 
+
 from vae import Decoder, Encoder
 from dit import DiTBLock
 from diffusers import FlaxDDIMScheduler, FlaxDDPMScheduler
-from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict, rando_colours
-from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn, SquareImageDataset
+from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
+from streaming_dataloader import threading_dataloader, collate_labeled_imagenet_fn, SquareImageNetDataset, rando_colours
 
 # sharding
 from jax.sharding import Mesh
@@ -36,7 +39,7 @@ mesh = Mesh(devices, axis_names=("data_parallel", "model_parallel"))
 
         # just fancy wrapper
 mixed_precision_policy = jmp.Policy(
-    compute_dtype=jnp.fl,
+    compute_dtype=jnp.bfloat16,
     param_dtype=jnp.float32,
     output_dtype=jnp.float32
 )
@@ -86,7 +89,8 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             n_heads=8, 
             use_flash_attention=False, 
             latent_size=8, 
-            n_class=1001 # last class is a null class where it's untrained and serve as random vector
+            n_class=1001, # last class is a null class where it's untrained and serve as random vector
+            pixel_based=True
         )
 
         # init model params
@@ -99,17 +103,20 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         dec_params = dec.init(dec_rng, dummy_latent)
         # dit
         latent = dummy_latent
-        img_pos = dit_backbone.create_2d_sinusoidal_pos(training_res // 32, training_res // 32)
-        timesteps = jnp.ones([128]).astype(jnp.int32)
-        dit_params = dit_backbone.init(dit_rng, latent, img_pos, timesteps)
+        # img_pos = dit_backbone.create_2d_sinusoidal_pos(training_res // 32, training_res // 32)
+        timesteps = jnp.ones([batch_size]).astype(jnp.int32)
+        conds = jnp.ones([batch_size]).astype(jnp.int32)
+        #  x, timestep, cond=None, image_pos=None, extra_pos=None
+        latent = jnp.ones((batch_size, training_res, training_res, 3))
+        dit_params = dit_backbone.init(dit_rng, latent, timesteps, conds)
 
 
         enc_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, enc_params)).values()))
         dec_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, dec_params)).values()))
         dit_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, dit_params)).values()))
-        print("encoder param count:", enc_param_count)
-        print("decoder param count:", dec_param_count)
-        print("decoder param count:", dit_param_count)
+        print("encoder param count:", f"{enc_param_count:,}")
+        print("decoder param count:", f"{dec_param_count:,}")
+        print("transformer param count:", f"{dit_param_count:,}")
         # create callable optimizer chain
         def adam_wrapper(mask):
             constant_scheduler = optax.constant_schedule(learning_rate)
@@ -132,7 +139,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             apply_fn=dit_backbone.apply,
             params=dit_params,
             tx=adam_wrapper(
-                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", enc_params)
+                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", dit_params)
             ),
         )
         # frozen
@@ -141,8 +148,8 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             params=enc_params,
         )
         # frozen
-        dec_state = train_state.TrainState.create(
-            apply_fn=dec.apply,
+        dec_state = FrozenModel(
+            call=dec.apply,
             params=dec_params,
         )
         
@@ -155,7 +162,10 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
             lambda leaf: jax.device_put(jmp.cast_to_half(leaf), device=NamedSharding(mesh, PartitionSpec())),
             dec_state,
         )
-
+        dit_state = jax.tree_map(
+            lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())),
+            dit_state,
+        )
         # TODO: yoink diffusers scheduler as separate module and simplify it for further tweaking 
         training_scheduler = FlaxDDPMScheduler(
             beta_start=0.00085,
@@ -195,8 +205,9 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         return [dit_state, enc_state, dec_state, training_scheduler_state, inference_scheduler_state]
 
 
-
+@jax.jit
 def train(dit_state, frozen_models, batch, train_rng):
+
     # always create new RNG!
     sample_rng, new_train_rng = jax.random.split(train_rng, num=2)
     
@@ -204,12 +215,12 @@ def train(dit_state, frozen_models, batch, train_rng):
     enc_state, training_scheduler_state = frozen_models
 
     def _compute_loss(
-        dit_params, training_scheduler_params, batch, rng_key
+        dit_params, enc_params, training_scheduler_params, batch, rng_key
     ):
         dit_params, enc_params, batch = mixed_precision_policy.cast_to_compute((dit_params, enc_params, batch))
-       
-        images = batch["image"]
-        class_cond = batch["label"]
+    
+        images = batch["images"]
+        class_cond = batch["labels"]
         n, h, w, c = images.shape
 
         latents = enc_state.call(enc_params, images)
@@ -233,7 +244,7 @@ def train(dit_state, frozen_models, batch, train_rng):
         # Sample a random timestep for each image
         timesteps = jax.random.randint(
             key=timestep_rng,
-            shape=(n, 1),
+            shape=(n,),
             minval=0,
             maxval=training_scheduler_state.call.config.num_train_timesteps,
         )
@@ -253,7 +264,7 @@ def train(dit_state, frozen_models, batch, train_rng):
         # MSE loss
         loss = (noise - predicted_noise) ** 2
         loss = loss.mean()
-        return loss
+        return mixed_precision_policy.cast_to_output(loss)
 
     grad_fn = jax.value_and_grad(
         fun=_compute_loss, argnums=[0,]  # differentiate first param only
@@ -261,28 +272,113 @@ def train(dit_state, frozen_models, batch, train_rng):
 
     loss, grad = grad_fn(
         dit_state.params,
+        enc_state.params,
         training_scheduler_state.params, 
         batch, 
         sample_rng,
     )
     # update weight and bias value
-    dit_state = dit_state.apply_gradients(grads=grad[0])
+    dit_state = dit_state.apply_gradients(grads=jmp.cast_to_full(grad[0]))
 
     # calculate loss
-    metrics = {"loss": loss}
+    metrics = {"mse_loss": loss}
     return (
         dit_state,
         metrics,
         new_train_rng,
     )
 
+@jax.jit
+def train_pixel_based(dit_state, frozen_models, batch, train_rng):
+
+    # always create new RNG!
+    sample_rng, new_train_rng = jax.random.split(train_rng, num=2)
+    
+    # unpack
+    enc_state, training_scheduler_state = frozen_models
+
+    def _compute_loss(
+        dit_params, enc_params, training_scheduler_params, batch, rng_key
+    ):
+        dit_params, enc_params, batch = mixed_precision_policy.cast_to_compute((dit_params, enc_params, batch))
+    
+        images = batch["images"]
+        class_cond = batch["labels"]
+        n, h, w, c = images.shape
+
+        # latents = enc_state.call(enc_params, images)
+
+        # logvar is not used
+        # we dont do sampling here, we just want mean value
+        # sampling only useful for decoder because decoder need to be robust to noise
+        # we want the distribution to be exact dead on the mean for the diffusion backbone 
+        # think of it like diffusion model doing sloppy job denoising the image and the 
+        # decoder cleaning up the remaining residual noise
+        # latent_mean, latent_logvar = rearrange(latents, "b h w (c split) -> split b h w c", split = 2)
+
+        # Sample noise that we'll add to the images
+        # I think I should combine this with the first noise seed generator
+        noise_rng, timestep_rng = jax.random.split(
+            key=rng_key, num=2
+        )
+        
+        noise = jax.random.normal(key=noise_rng, shape=images.shape)
+
+        # Sample a random timestep for each image
+        timesteps = jax.random.randint(
+            key=timestep_rng,
+            shape=(n,),
+            minval=0,
+            maxval=training_scheduler_state.call.config.num_train_timesteps,
+        )
+
+        # Add noise to the images according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_image = training_scheduler_state.call.add_noise(
+            state=training_scheduler_params,
+            original_samples=images,
+            noise=noise,
+            timesteps=timesteps,
+        )
+        #  x, timestep, cond, image_pos, extra_pos=None
+        # TODO: add a way to interpolate positional embedding
+        predicted_noise = dit_state.apply_fn(dit_params, noisy_image, timesteps, class_cond)
+
+        # MSE loss
+        loss = (noise - predicted_noise) ** 2
+        loss = loss.mean()
+        return mixed_precision_policy.cast_to_output(loss)
+
+    grad_fn = jax.value_and_grad(
+        fun=_compute_loss, argnums=[0,]  # differentiate first param only
+    )
+
+    loss, grad = grad_fn(
+        dit_state.params,
+        enc_state.params,
+        training_scheduler_state.params, 
+        batch, 
+        sample_rng,
+    )
+    # update weight and bias value
+    dit_state = dit_state.apply_gradients(grads=jmp.cast_to_full(grad[0]))
+
+    # calculate loss
+    metrics = {"mse_loss": loss}
+    return (
+        dit_state,
+        metrics,
+        new_train_rng,
+    )
+
+@jax.jit
 def inference(
     dit_state,
     frozen_models,
     class_cond,
     seed = jax.random.key(0),
-    width = 256,
-    height = 256,
+    width = 8,
+    height = 8,
     n_latent_dim = 768,
     guidance_scale = 1,
     num_inference_steps = 50,
@@ -317,7 +413,7 @@ def inference(
         # get scheduler timestep (reverse time step) from this loop step
         t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[loop_counter]
         # create broadcastable array for the batch dim
-        timestep = jnp.broadcast_to(t, latents.shape[0])[:, None]
+        timestep = jnp.broadcast_to(t, latents.shape[0])
 
         # get sample noised latent from the schedule
         latents = inference_scheduler_state.call.scale_model_input(
@@ -355,13 +451,90 @@ def inference(
     return images
 
 
+@jax.jit
+def inference_pixel_space(
+    dit_state,
+    frozen_models,
+    class_cond,
+    seed = jax.random.key(0),
+    width = 8,
+    height = 8,
+    n_latent_dim = 3,
+    guidance_scale = 1,
+    num_inference_steps = 50,
+):  
+    # unpack
+    dec_state, inference_scheduler_state = frozen_models
+    batch_count = len(class_cond)
+
+    # generate random latent images 
+    # number of element in class_cond will determine the number of images generated 
+    latents_shape = (batch_count, height, width, n_latent_dim)
+    latents = jax.random.normal(seed, shape=latents_shape, dtype=jnp.float32)
+
+
+    scheduler_state = inference_scheduler_state.call.set_timesteps(
+        inference_scheduler_state.params, 
+        num_inference_steps=num_inference_steps, 
+        shape=latents_shape
+    )
+
+    # scale the initial noise by the scale required by the scheduler
+    latents = latents * inference_scheduler_state.params.init_noise_sigma
+
+    # pack it so jax for i loop can work on this 
+    loop_state = (scheduler_state, latents)
+
+    def single_step_pass(loop_counter, loop_state):  
+        scheduler_state, latents = loop_state
+        # need 2 images one for prompt and the other for neg prompt so just duplicate this
+        # this is used for classifier free guidance, to contrast the vector towards bad stuff
+
+        # get scheduler timestep (reverse time step) from this loop step
+        t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[loop_counter]
+        # create broadcastable array for the batch dim
+        timestep = jnp.broadcast_to(t, latents.shape[0])
+
+        # get sample noised latent from the schedule
+        latents = inference_scheduler_state.call.scale_model_input(
+            scheduler_state, latents, timestep
+        )
+
+        # predict the noise residual to be substracted
+        #  x, timestep, cond, image_pos, extra_pos=None
+        predicted_noise = dit_state.apply_fn(dit_state.params, latents, timestep, class_cond)
+        predicted_noise_uncond = dit_state.apply_fn(
+            dit_state.params, 
+            latents, 
+            timestep, 
+            jnp.array([1000] * batch_count).astype(jnp.int32) # condition on null class (untrained embedding vector)
+        )
+
+        # classifier free guidance
+        noise_pred = predicted_noise_uncond + guidance_scale * (predicted_noise - predicted_noise_uncond)
+
+        # "subtract" the noise and return less noised sample  and the state back
+        latents, scheduler_state = inference_scheduler_state.call.step(
+            scheduler_state, noise_pred, t, latents
+        ).to_tuple()
+
+        return scheduler_state, latents
+
+    # functional way to write for loops (don't judge)
+    loop_state = jax.lax.fori_loop(0, num_inference_steps, single_step_pass, loop_state)
+
+    # unpack loop_state
+    scheduler_state, latents = loop_state
+
+    return latents
+
 def main():
     BATCH_SIZE = 128
     SEED = 0
     SAVE_MODEL_PATH = "dit_ckpt"
-    IMAGE_RES = 256
+    IMAGE_RES = 8
     SAVE_EVERY = 500
-    LEARNING_RATE = 2e-4
+    LEARNING_RATE = 1e-4
     WANDB_PROJECT_NAME = "DiT"
     WANDB_RUN_NAME = "test"
     WANDB_LOG_INTERVAL = 100
@@ -374,8 +547,15 @@ def main():
     train_rng = jax.random.PRNGKey(SEED)
     # init checkpoint manager
     ckpt_manager = checkpoint_manager(SAVE_MODEL_PATH)
-    # init model
-    models = init_model(batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
+    # init models
+    models = init_model(batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE, training_res=IMAGE_RES)
+    # unpack models
+    dit_state, enc_state, dec_state, training_scheduler_state, inference_scheduler_state = models
+    # pack for training
+    frozen_training_state = [enc_state, training_scheduler_state]
+    # pack for inference
+    frozen_inference_state = [dec_state, inference_scheduler_state]
+
 
     # Open the text file in read mode
     image_paths = ["ramdisk/train_images"] * 10
@@ -384,8 +564,8 @@ def main():
     try:
         for image_path in image_paths:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
-            dataset = SquareImageDataset(image_path, square_size=IMAGE_RES, seed=STEPS)
-            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,  num_workers=100, prefetch_factor=3, seed=SEED)
+            dataset = SquareImageNetDataset(image_path, square_size=IMAGE_RES, seed=STEPS)
+            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=3, seed=SEED)
             # Initialize the progress bar
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
@@ -394,38 +574,41 @@ def main():
                 if i > len(dataset) // BATCH_SIZE -10:
                     # i should fix my dataloader instead of doing this
                     break          
-                # image
-                batch = batch / 255 * 2 - 1
+                # image batch already rescaled inside collate_labeled_imagenet_fn
+                # regularization to flat colours
+                # batch["images"][0] = rando_colours(IMAGE_RES)
+                # batch["labels"][0] = 1000
 
-                batch[0] = rando_colours(IMAGE_RES)
-
-                batch = jax.tree_map(
+                batch["images"] = jax.tree_map(
                     lambda leaf: jax.device_put(
                         leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel", None, None, None))
                     ),
-                    batch,
+                    batch["images"],
+                )
+                batch["labels"] = jax.tree_map(
+                    lambda leaf: jax.device_put(
+                        leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel"))
+                    ),
+                    batch["labels"],
                 )
 
-                models, train_rng, output, stats = train(models, batch, LOSS_SCALE, train_rng)
+                dit_state, metrics, train_rng = train_pixel_based(dit_state, frozen_training_state, batch, train_rng)
+                # dit_state, metrics, train_rng = train(dit_state, frozen_training_state, batch, train_rng)
 
+                if jnp.isnan(metrics["mse_loss"]).any():
+                    raise ValueError("The array contains NaN values")
 
                 if i % WANDB_LOG_INTERVAL == 0:
-                    wandb.log(stats, step=STEPS)
-
-                    preview_test = inference(models, sample_image)
-                    preview = jnp.concatenate([batch[:4], preview_test[:4]], axis = 0)
-                    preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
-
-                    create_image_mosaic(preview, 3, len(preview)//3, f"{STEPS}.png")
-
+                    progress_bar.set_description(f"{metrics}")
+                    wandb.log(metrics, step=STEPS)
 
                 # save every n steps
                 if i % SAVE_EVERY == 0:
-                    preview_test = inference(models, sample_image)
-                    preview = jnp.concatenate([batch[:4], preview_test[:4]], axis = 0)
+                    # preview = inference(dit_state, frozen_inference_state, batch["labels"][:4])
+                    preview = inference_pixel_space(dit_state, frozen_inference_state, batch["labels"][:4])
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                    create_image_mosaic(preview, 3, len(preview)//3, f"{STEPS}.png")
+                    create_image_mosaic(preview, 2, 2, f"{STEPS}.png")
                     wandb.log({"image": wandb.Image(f'{STEPS}.png')}, step=STEPS)
 
                     ckpt_manager.save(STEPS, models)
@@ -434,8 +617,8 @@ def main():
                 progress_bar.update(1)
 
     except KeyboardInterrupt:
-        i = -1
+        STEPS += 1
         print("Ctrl+C command detected. saving model before exiting...")
-        ckpt_manager.save(i, models)
+        ckpt_manager.save(STEPS, models)
 
 main()

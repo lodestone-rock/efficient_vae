@@ -87,7 +87,8 @@ class SelfAttention(nn.Module):
         )
         self.out = nn.Dense(
             features=self.embed_dim, 
-            use_bias=self.use_bias
+            use_bias=self.use_bias,
+            kernel_init=jax.nn.initializers.zeros
         )
 
     def __call__(self, x, pos=None):
@@ -133,16 +134,24 @@ class GLU(nn.Module):
     embed_dim: int = 768
     expansion_factor: int = 4
     use_bias: bool = False
+    eps:float = 1e-6
 
     def setup(self):
+        self.rms_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+
         # inverted bottleneck with gating
         # practically mimicing mobilenet except only pointwise conv
         self.up_proj = nn.Dense(self.embed_dim * self.expansion_factor, use_bias=False)
         self.gate_proj = nn.Dense(self.embed_dim * self.expansion_factor, use_bias=False)
-        self.down_proj = nn.Dense(self.embed_dim, use_bias=False)
+        self.down_proj = nn.Dense(self.embed_dim, use_bias=False, kernel_init=jax.nn.initializers.zeros)
 
     def __call__(self, x):
         residual = x
+        x = self.rms_norm(x)
         x = self.down_proj(self.up_proj(x) * nn.silu(self.gate_proj(x)))
         return x + residual
 
@@ -162,9 +171,16 @@ class DiTBLock(nn.Module):
     use_flash_attention: bool = False
     n_class: int = 1000
     latent_size: int = 8
+    pixel_based: bool = False
 
     def setup(self):
         
+        if self.pixel_based:
+            self.linear_proj_input = nn.Dense(
+                features=self.embed_dim, 
+                use_bias=self.use_bias
+            )
+
         if self.latent_size is not None:
             self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size, self.latent_size)
         if self.use_flash_attention:
@@ -193,7 +209,7 @@ class DiTBLock(nn.Module):
                 embed_dim=self.embed_dim,
                 use_flash_attention=self.use_flash_attention
             )
-            glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias)
+            glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps)
 
             dit_blocks.append([attn, glu])
 
@@ -203,10 +219,27 @@ class DiTBLock(nn.Module):
         time_embedding_stack = [] 
         for layer in range(self.n_layers):
             # overkill but eh whatever
-            glu_time = GLU(embed_dim=self.embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias)
+            glu_time = GLU(embed_dim=self.embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias,  eps=self.eps)
 
             time_embedding_stack.append(glu_time)
         self.time_embedding_stack = time_embedding_stack
+
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        if self.pixel_based:
+            self.output = nn.Dense(
+                features=3, 
+                use_bias=self.use_bias
+            )
+        else:
+            self.output = nn.Dense(
+                features=self.embed_dim, 
+                use_bias=self.use_bias
+            )
+
         
     def create_2d_sinusoidal_pos(self, width_len=8, height_len=8):
 
@@ -234,16 +267,18 @@ class DiTBLock(nn.Module):
         # NHWC => BLD 
         n, h, w, c = x.shape
 
+        if self.pixel_based:
+            x = self.linear_proj_input(x)
         # use default image position latent if not provided
         if self.latent_size is not None:
-            x = x + self.latent_positional_embedding
+            x = x + jax.lax.stop_gradient(self.latent_positional_embedding)
         else:
             x = x + image_pos
         x = rearrange(x, "n h w c-> n (h w) c")
         # time loop 
-        time = self.time_embed(timestep) # grab the time
+        time = self.time_embed(timestep)[:,None,:] # grab the time
         if self.n_class is not None:
-            class_cond = self.class_embed(cond)
+            class_cond = self.class_embed(cond)[:,None,:]
         # mebbe ditching this loop is simpler 
         # simple time embedding vector should suffice
         # silly ideas, rescale the input vector relative to this 
@@ -254,9 +289,9 @@ class DiTBLock(nn.Module):
         # TODO: add rope
 
         if self.n_class is not None:
-            x = jnp.concatenate([time[:,None,:], class_cond[:,None,:], x], axis=-2) # put time embedding in the seq dim
+            x = jnp.concatenate([time, class_cond, x], axis=-2) # put time embedding in the seq dim
         else:
-            x = jnp.concatenate([time[:,None,:], x], axis=-2) # put time embedding in the seq dim
+            x = jnp.concatenate([time, x], axis=-2) # put time embedding in the seq dim
         # attention block loop
         for attn, glu in self.dit_blocks:
             x = attn(x, extra_pos) # NOTE: if using this pos put image token in 1 position!
@@ -266,6 +301,8 @@ class DiTBLock(nn.Module):
         else:
             x = x[:,1:,:] # pop time embedding
         x = rearrange(x, "n (h w) c -> n h w c", h=h)
+        x = self.final_norm(x)
+        x = nn.tanh(self.output(x))
         return x
 
 # model = DiTBLock(n_layers=3, embed_dim=10, n_heads=2, use_flash_attention=False, latent_size=8)
