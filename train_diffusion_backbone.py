@@ -84,11 +84,11 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         )
 
         dit_backbone = DiTBLock(
-            n_layers=24, 
+            n_layers=10, 
             embed_dim=768, 
             n_heads=8, 
             use_flash_attention=False, 
-            latent_size=8, 
+            latent_size=training_res, 
             n_class=1001, # last class is a null class where it's untrained and serve as random vector
             pixel_based=True
         )
@@ -117,6 +117,9 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         print("encoder param count:", f"{enc_param_count:,}")
         print("decoder param count:", f"{dec_param_count:,}")
         print("transformer param count:", f"{dit_param_count:,}")
+        tabulate_dit_backbone = nn.tabulate(dit_backbone, jax.random.key(0), compute_flops=True, compute_vjp_flops=True)
+
+        print(tabulate_dit_backbone(latent, timesteps, conds))
         # create callable optimizer chain
         def adam_wrapper(mask):
             constant_scheduler = optax.constant_schedule(learning_rate)
@@ -377,8 +380,8 @@ def inference(
     frozen_models,
     class_cond,
     seed = jax.random.key(0),
-    width = 8,
-    height = 8,
+    width = 32,
+    height = 32,
     n_latent_dim = 768,
     guidance_scale = 1,
     num_inference_steps = 50,
@@ -457,12 +460,13 @@ def inference_pixel_space(
     frozen_models,
     class_cond,
     seed = jax.random.key(0),
-    width = 8,
-    height = 8,
+    width = 32,
+    height = 32,
     n_latent_dim = 3,
-    guidance_scale = 1,
-    num_inference_steps = 50,
+    guidance_scale = 3,
+    num_inference_steps = 100,
 ):  
+    guidance_scale = jnp.array([guidance_scale], dtype=jnp.float32)
     # unpack
     dec_state, inference_scheduler_state = frozen_models
     batch_count = len(class_cond)
@@ -472,6 +476,8 @@ def inference_pixel_space(
     latents_shape = (batch_count, height, width, n_latent_dim)
     latents = jax.random.normal(seed, shape=latents_shape, dtype=jnp.float32)
 
+    # scale the initial noise by the scale required by the scheduler
+    latents = latents * inference_scheduler_state.params.init_noise_sigma
 
     scheduler_state = inference_scheduler_state.call.set_timesteps(
         inference_scheduler_state.params, 
@@ -479,8 +485,6 @@ def inference_pixel_space(
         shape=latents_shape
     )
 
-    # scale the initial noise by the scale required by the scheduler
-    latents = latents * inference_scheduler_state.params.init_noise_sigma
 
     # pack it so jax for i loop can work on this 
     loop_state = (scheduler_state, latents)
@@ -521,8 +525,11 @@ def inference_pixel_space(
         return scheduler_state, latents
 
     # functional way to write for loops (don't judge)
+    # run with python for loop
+    # for i in range(num_inference_steps):
+    #     latents, scheduler_state = single_step_pass(i, loop_state)
     loop_state = jax.lax.fori_loop(0, num_inference_steps, single_step_pass, loop_state)
-
+# 
     # unpack loop_state
     scheduler_state, latents = loop_state
 
@@ -532,7 +539,7 @@ def main():
     BATCH_SIZE = 128
     SEED = 0
     SAVE_MODEL_PATH = "dit_ckpt"
-    IMAGE_RES = 8
+    IMAGE_RES = 32
     SAVE_EVERY = 500
     LEARNING_RATE = 1e-4
     WANDB_PROJECT_NAME = "DiT"
@@ -565,7 +572,7 @@ def main():
         for image_path in image_paths:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
             dataset = SquareImageNetDataset(image_path, square_size=IMAGE_RES, seed=STEPS)
-            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=3, seed=SEED)
+            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=SEED)
             # Initialize the progress bar
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
@@ -601,14 +608,16 @@ def main():
                 if i % WANDB_LOG_INTERVAL == 0:
                     progress_bar.set_description(f"{metrics}")
                     wandb.log(metrics, step=STEPS)
+                    preview = inference_pixel_space(dit_state, frozen_inference_state, batch["labels"][:BATCH_SIZE//4])
+                    preview = np.array((jnp.concatenate([preview, batch["images"][:BATCH_SIZE//4]], axis=0) + 1) / 2 * 255, dtype=np.uint8)
+                    create_image_mosaic(preview, 8, 8, f"{STEPS}.png")
 
                 # save every n steps
                 if i % SAVE_EVERY == 0:
                     # preview = inference(dit_state, frozen_inference_state, batch["labels"][:4])
                     preview = inference_pixel_space(dit_state, frozen_inference_state, batch["labels"][:4])
-                    preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
-
-                    create_image_mosaic(preview, 2, 2, f"{STEPS}.png")
+                    preview = np.array((jnp.concatenate([preview, batch["images"][:4]], axis=0) + 1) / 2 * 255, dtype=np.uint8)
+                    create_image_mosaic(preview, 2, 4, f"{STEPS}.png")
                     wandb.log({"image": wandb.Image(f'{STEPS}.png')}, step=STEPS)
 
                     ckpt_manager.save(STEPS, models)
