@@ -7,6 +7,25 @@ from typing import Tuple, Tuple
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 
+def rand_stratified_cosine(rng_key, batch, sigma_data=1., min_value=1e-3, max_value=1e3):
+    # do stratified sampling on cosine timesteps, ensuring within each batch 
+    # it will always has representation for each section of the timesteps
+    offsets = jnp.arange(0, batch)
+    u = jax.random.uniform(rng_key, [batch])
+    u = (offsets + u) / batch
+    u = jnp.linspace(0,1, 10000)
+
+    def logsnr_schedule_cosine(t, logsnr_min, logsnr_max):
+        t_min = jnp.atan(jnp.exp(-0.5 * logsnr_max))
+        t_max = jnp.atan(jnp.exp(-0.5 * logsnr_min))
+        return -2 * jnp.log(jnp.tan(t_min + t * (t_max - t_min)))
+
+    logsnr_min = -2 * jnp.log(min_value / sigma_data)
+    logsnr_max = -2 * jnp.log(max_value / sigma_data)
+    logsnr = logsnr_schedule_cosine(u, logsnr_min, logsnr_max)
+    return jnp.exp(-logsnr / 2) * sigma_data
+
+
 # for rope, time, and 2d pos
 def create_sinusoidal_positions_fn(pos, dim=768, freq_scale=None):
     with jax.default_device(jax.devices("cpu")[0]):
@@ -217,6 +236,27 @@ class GLU(nn.Module):
             return x + residual
 
 
+class FourierLayers(nn.Module):
+    # linear layer probably sufficient but eh why not
+    features: int = 768
+    keep_random: bool = False # random fourier features mode
+
+    def setup(self):
+        self.freq =  nn.Dense(
+            features=self.embed_dim // 2, 
+            use_bias=self.use_bias
+        )
+
+    def __call__(self, timesteps):
+        
+        if self.keep_random:
+            freq = jax.lax.stop_gradient(nn.freq(timesteps * jnp.pi * 2))
+        else:    
+            freq = nn.freq(timesteps * jnp.pi * 2)
+        return jnp.concatenate([jnp.sin(freq), jnp.cos(freq)], axis=-1)
+
+
+
 class DiTBLock(nn.Module):
     embed_dim: int = 768
 
@@ -372,6 +412,198 @@ class DiTBLock(nn.Module):
         x = self.output(x)
         x = rearrange(x, "n (h w) c -> n h w c", h=h)
         return x
+
+
+class DiTBLockContinuous(nn.Module):
+    # to use this model during inference please wrap model.apply with model.pred method
+    # model.pred(model.apply, x, timesteps, conds, *rest_of_args)
+    sigma_data: float = 0.5
+
+    embed_dim: int = 768
+
+    attn_expansion_factor: int = 2
+    glu_expansion_factor: int = 4
+    use_bias: bool = False
+    eps:float = 1e-6
+    n_heads: int = 8
+    n_layers: int = 24
+    n_time_embed_layers: int = 3
+    time_embed_expansion_factor: int = 2
+    diffusion_timesteps: int = 1000
+    use_flash_attention: bool = False
+    n_class: int = 1000
+    latent_size: int = 8
+    pixel_based: bool = False
+    random_fourier_features: bool = False
+
+    def setup(self):
+        
+
+        self.linear_proj_input = nn.Dense(
+            features=self.embed_dim, 
+            use_bias=self.use_bias
+        )
+
+        if self.latent_size is not None:
+            self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size)
+        if self.use_flash_attention:
+            raise Exception("not supported yet! still have to figure out padding shape")
+
+        self.time_embed = FourierLayers(
+            features=self.embed_dim, 
+            keep_random=self.random_fourier_features,
+        )
+
+        # class embed just an ordinary lookup table
+        if self.n_class is not None:
+            self.class_embed = nn.Embed(
+                self.n_class, 
+                features=self.embed_dim
+            )
+
+        # transformers
+        dit_blocks = []
+        for layer in range(self.n_layers):
+            attn = SelfAttention(
+                n_heads=self.n_heads, 
+                expansion_factor=self.attn_expansion_factor, 
+                use_bias=self.use_bias, 
+                eps=self.eps,
+                embed_dim=self.embed_dim,
+                use_flash_attention=self.use_flash_attention
+            )
+            glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps)
+
+            dit_blocks.append([attn, glu])
+
+        self.dit_blocks = dit_blocks
+
+        # time embedding
+        time_embedding_stack = [] 
+        for layer in range(self.n_layers):
+            # overkill but eh whatever
+            glu_time = GLU(embed_dim=self.embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias, eps=self.eps, cond=False)
+
+            time_embedding_stack.append(glu_time)
+        self.time_embedding_stack = time_embedding_stack
+
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        self.cond_projection =  nn.Dense(
+            features=self.embed_dim * 2, 
+            use_bias=self.use_bias
+        )
+        if self.pixel_based:
+            self.output = nn.Dense(
+                features=3, 
+                use_bias=self.use_bias
+            )
+        else:
+            self.output = nn.Dense(
+                features=self.embed_dim, 
+                use_bias=self.use_bias
+            )
+
+        
+    def create_2d_sinusoidal_pos(self, width_len=8, height_len=8):
+        pos = create_2d_sinusoidal_positions_fn(self.embed_dim, width_len, freq_scale=None, relative_center=False, for_rope=False)
+        # pos = create_2d_sinusoidal_positions_fn(
+        #     width_len=width_len, 
+        #     height_len=height_len, 
+        #     dim=self.embed_dim, 
+        #     max_freq=self.embed_dim // 2, 
+        #     epsilon=self.eps
+        # )
+        return pos[None, ...] # add batch dim HWC -> NHWC
+    
+    def create_sinusoidal_rope_pos(self):
+        # theta pos for sine and cosine rope
+        pos = create_sinusoidal_positions_fn(
+            num_pos=self.diffusion_timesteps,
+            dim=self.embed_dim,
+        )
+        return pos
+
+
+    def sigma_scaling(self, timesteps):
+        # this is karras preconditioning formula to help the model stays in unit variance
+        # better alternatives than replacing the noise from standard gaussian to have unit variance 
+        c_skip = self.sigma_data ** 2 / (timesteps ** 2 + self.sigma_data ** 2)
+        c_out = timesteps * self.sigma_data / (timesteps ** 2 + self.sigma_data ** 2) ** 0.5
+        c_in = 1 / (timesteps ** 2 + self.sigma_data ** 2) ** 0.
+        # reweight loss so it focus more on low frequency denoising part
+        soft_weighting = (timesteps * self.sigma_data) ** 2 / (timesteps ** 2 + self.sigma_data ** 2) ** 2
+        return c_skip, c_out, c_in, soft_weighting
+
+
+    def loss(self, rng_key, model_apply_fn, images, timesteps, conds, image_pos=None, extra_pos=None):
+        c_skip, c_out, c_in, soft_weighting = self.sigma_scaling(timesteps)
+        noises = jax.random.normal(key=rng_key, shape=images.shape)
+        noised_images = (images + noises * timesteps) * c_in
+        model_predictions = model_apply_fn(noised_images, timesteps, conds, image_pos, extra_pos)
+        # target "noise"
+        # this scaling has interesting dynamics if you print out the image
+        # mainly the model returned a prediction based on frequency that remains after noise is added
+        target_predictions = (images - noised_images * c_skip)/c_out
+        loss = jnp.mean((model_predictions-target_predictions)** 2) * soft_weighting
+        return loss
+
+
+    def pred(self, model_apply_fn, images, timesteps, conds, image_pos=None, extra_pos=None):
+        c_skip, c_out, c_in, _ = self.sigma_scaling(timesteps)
+        return model_apply_fn(images * c_in, timesteps, conds, image_pos, extra_pos) * c_out + images * c_skip
+        
+
+    def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None):
+        # NOTE: flax uses NHWC convention so the entire ops is in NHWC
+        # merge height and weight and treat it as a token sequence
+        # NHWC => BLD 
+        n, h, w, c = x.shape
+        x = rearrange(x, "n h w c-> n (h w) c")
+        x = self.linear_proj_input(x)
+        # use default image position latent if not provided
+        if self.latent_size is not None:
+            x = x + jax.lax.stop_gradient(self.latent_positional_embedding)
+        else:
+            x = x + image_pos
+        
+        # time loop 
+        time = self.time_embed(timestep)[:,None,:] # grab the time
+        if self.n_class is not None:
+            class_cond = self.class_embed(cond)[:,None,:]
+            cond = time + class_cond
+        # mebbe ditching this loop is simpler 
+        # simple time embedding vector should suffice
+        # silly ideas, rescale the input vector relative to this 
+        # so the model pay more attention to the timesteps or class
+        for glu_time in self.time_embedding_stack:
+            cond = glu_time(cond)
+        cond = nn.silu(cond)
+
+        # TODO: add rope
+
+        # if self.n_class is not None:
+        #     x = jnp.concatenate([time, class_cond, x], axis=-2) # put time embedding in the seq dim
+        # else:
+        #     x = jnp.concatenate([time, x], axis=-2) # put time embedding in the seq dim
+        # attention block loop
+        for attn, glu in self.dit_blocks:
+            x = attn(x, cond, extra_pos) # NOTE: if using this pos put image token in 1 position!
+            x = glu(x, cond)
+        # if self.n_class is not None:
+        #     x = x[:,2:,:] # pop time and class embedding
+        # else:
+        #     x = x[:,1:,:] # pop time embedding
+        x = self.final_norm(x)
+        scale, shift = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=2)
+        x = embedding_modulation(x, scale, shift)
+        x = self.output(x)
+        x = rearrange(x, "n (h w) c -> n h w c", h=h)
+        return x
+
 
 # model = DiTBLock(n_layers=3, embed_dim=10, n_heads=2, use_flash_attention=False, latent_size=8)
 
