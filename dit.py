@@ -5,7 +5,25 @@ from einops import rearrange
 import math
 from typing import Tuple, Tuple
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+import numpy as np
 
+# def rand_stratified_cosine(rng_key, batch, sigma_data=1., min_value=1e-3, max_value=1e3):
+#     # do stratified sampling on cosine timesteps, ensuring within each batch 
+#     # it will always has representation for each section of the timesteps
+#     offsets = jnp.arange(0, batch)
+#     u = jax.random.uniform(rng_key, [batch])
+#     u = (offsets + u) / batch
+#     # u = jnp.linspace(0,1, 10000)
+
+#     def logsnr_schedule_cosine(t, logsnr_min, logsnr_max):
+#         t_min = jnp.atan(jnp.exp(-0.5 * logsnr_max))
+#         t_max = jnp.atan(jnp.exp(-0.5 * logsnr_min))
+#         return -2 * jnp.log(jnp.tan(t_min + t * (t_max - t_min)))
+
+#     logsnr_min = -2 * jnp.log(min_value / sigma_data)
+#     logsnr_max = -2 * jnp.log(max_value / sigma_data)
+#     logsnr = logsnr_schedule_cosine(u, logsnr_min, logsnr_max)
+#     return jnp.exp(-logsnr / 2) * sigma_data
 
 def rand_stratified_cosine(rng_key, batch, sigma_data=1., min_value=1e-3, max_value=1e3):
     # do stratified sampling on cosine timesteps, ensuring within each batch 
@@ -13,21 +31,15 @@ def rand_stratified_cosine(rng_key, batch, sigma_data=1., min_value=1e-3, max_va
     offsets = jnp.arange(0, batch)
     u = jax.random.uniform(rng_key, [batch])
     u = (offsets + u) / batch
-    u = jnp.linspace(0,1, 10000)
+    # u = jnp.linspace(0,1, 10000)
 
-    def logsnr_schedule_cosine(t, logsnr_min, logsnr_max):
-        t_min = jnp.atan(jnp.exp(-0.5 * logsnr_max))
-        t_max = jnp.atan(jnp.exp(-0.5 * logsnr_min))
-        return -2 * jnp.log(jnp.tan(t_min + t * (t_max - t_min)))
-
-    logsnr_min = -2 * jnp.log(min_value / sigma_data)
-    logsnr_max = -2 * jnp.log(max_value / sigma_data)
-    logsnr = logsnr_schedule_cosine(u, logsnr_min, logsnr_max)
-    return jnp.exp(-logsnr / 2) * sigma_data
-
+    min_cdf = jnp.atan(min_value / sigma_data) * 2 / jnp.pi
+    max_cdf = jnp.atan(max_value / sigma_data) * 2 / jnp.pi
+    u = u * (max_cdf - min_cdf) + min_cdf
+    return jnp.tan(u * jnp.pi / 2) * sigma_data
 
 # for rope, time, and 2d pos
-def create_sinusoidal_positions_fn(pos, dim=768, freq_scale=None):
+def create_sinusoidal_positions_fn(pos, dim=768, freq_scale=None, concat_sin_cos=True):
     with jax.default_device(jax.devices("cpu")[0]):
         assert dim % 2 == 0
         # just a list of number to enumerate each dim (divided by 2 because we use a half for sine and other for cosine)
@@ -45,7 +57,10 @@ def create_sinusoidal_positions_fn(pos, dim=768, freq_scale=None):
         
         freqs = jnp.einsum("i , j -> i j", pos, inv_freq).astype("float32")
 
-        return jnp.concatenate([jnp.cos(freqs), jnp.sin(freqs)],axis=-1)
+        if concat_sin_cos:
+            return jnp.concatenate([jnp.sin(freqs), jnp.cos(freqs)],axis=-1)
+        else:
+            return jnp.sin(freqs), jnp.cos(freqs)
     
 
 def create_1d_sinusoidal_positions_fn(num_pos=1024, dim=768, freq_scale=10000):
@@ -53,7 +68,7 @@ def create_1d_sinusoidal_positions_fn(num_pos=1024, dim=768, freq_scale=10000):
         return create_sinusoidal_positions_fn(jnp.arange(num_pos), dim, freq_scale)
 
 
-def create_2d_sinusoidal_positions_fn(embed_dim, grid_size, freq_scale=None, relative_center=False, for_rope=False):
+def create_2d_sinusoidal_positions_fn(embed_dim, grid_size, freq_scale=None, relative_center=False):
     # assume square image for now
     if freq_scale is None:
         freq_scale = embed_dim // 10
@@ -67,14 +82,9 @@ def create_2d_sinusoidal_positions_fn(embed_dim, grid_size, freq_scale=None, rel
     # practically just replicating w and h from (1, grid_size) to (grid_size, grid_size)
     h, w = jnp.meshgrid(w, h)
 
-    pos_w = create_sinusoidal_positions_fn(w.reshape(-1), embed_dim // 2, freq_scale)
-    pos_h = create_sinusoidal_positions_fn(h.reshape(-1), embed_dim // 2, freq_scale)
-    if for_rope:
-        # just use sine part as theta angle rotation
-        pos_h = jnp.concatenate([pos_h[..., :embed_dim // 4]] * 2, axis = -1)
-        pos_w = jnp.concatenate([pos_w[..., :embed_dim // 4]] * 2, axis = -1)
-
-    return jnp.concatenate([pos_h, pos_w], axis=-1)
+    pos_w_sin, pos_w_cos = create_sinusoidal_positions_fn(w.reshape(-1), embed_dim, freq_scale, False)
+    pos_h_sin, pos_h_cos = create_sinusoidal_positions_fn(h.reshape(-1), embed_dim, freq_scale, False)
+    return jnp.concatenate([pos_h_sin, pos_w_sin, pos_h_cos, pos_w_cos], axis=-1)
 
 
 # def create_2d_sinusoidal_positions_fn(width_len=8, height_len=8, dim=768, max_freq=None):
@@ -120,7 +130,7 @@ def rotate_half(tensor):
 
 # yoinked from hf transformers
 def apply_rotary_pos_emb(tensor, pos):
-    sin_pos, cos_pos = pos
+    sin_pos, cos_pos = rearrange(pos[...,None,:], "b l h (d sincos)-> sincos b l h d", sincos=2)
     return (tensor * cos_pos) + (rotate_half(tensor) * sin_pos)
 
 
@@ -168,10 +178,6 @@ class SelfAttention(nn.Module):
         # query, key, value
         q, k, v = rearrange(self.qkv(x), "b l (d split) -> split b l d", split=3)
         # if using rotary
-        if pos is not None:
-            # pos is theta angle for rotary embedding
-            q = apply_rotary_pos_emb(q, pos)
-            k = apply_rotary_pos_emb(k, pos)
         if self.use_flash_attention:
             # [batch_size, num_heads, q_seq_len, d_model]
             q = rearrange(q, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
@@ -179,6 +185,10 @@ class SelfAttention(nn.Module):
             k = rearrange(k, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
             # [batch_size, num_heads, kv_seq_len, d_model]
             v = rearrange(v, "b l (d n_head) -> b n_head l d", n_head=self.n_heads)
+            if pos is not None:
+                # pos is theta angle for rotary embedding
+                q = apply_rotary_pos_emb(q, pos)
+                k = apply_rotary_pos_emb(k, pos)
             # use pallas flash attention kernel
             # https://github.com/google/jax/issues/18590#issuecomment-1830671863
             # turns out no need to use this since we're dealing with seq length smaller than 4096
@@ -192,6 +202,10 @@ class SelfAttention(nn.Module):
             k = rearrange(k, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
             # [batch_size, num_heads, kv_seq_len, d_model]
             v = rearrange(v, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+            if pos is not None:
+                # pos is theta angle for rotary embedding
+                q = apply_rotary_pos_emb(q, pos)
+                k = apply_rotary_pos_emb(k, pos)
             out = nn.dot_product_attention(q,k,v)
             # output projection
             out = rearrange(out, "b l n_head d -> b l (n_head d)")
@@ -225,10 +239,10 @@ class GLU(nn.Module):
 
     def __call__(self, x, cond=None):
         residual = x
+        x = self.rms_norm(x)
         if self.cond:
             scale, shift, gate = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=3)
             x = embedding_modulation(x, scale, shift)
-        x = self.rms_norm(x)
         x = self.down_proj(self.up_proj(x) * nn.silu(self.gate_proj(x)))
         if self.cond:
             return x + residual + gate
@@ -243,8 +257,8 @@ class FourierLayers(nn.Module):
 
     def setup(self):
         self.freq =  nn.Dense(
-            features=self.embed_dim // 2, 
-            use_bias=self.use_bias
+            features=self.features // 2, 
+            use_bias=False
         )
 
     def __call__(self, timesteps):
@@ -252,7 +266,7 @@ class FourierLayers(nn.Module):
         if self.keep_random:
             freq = jax.lax.stop_gradient(nn.freq(timesteps * jnp.pi * 2))
         else:    
-            freq = nn.freq(timesteps * jnp.pi * 2)
+            freq = self.freq(timesteps * jnp.pi * 2)
         return jnp.concatenate([jnp.sin(freq), jnp.cos(freq)], axis=-1)
 
 
@@ -356,14 +370,6 @@ class DiTBLock(nn.Module):
         #     epsilon=self.eps
         # )
         return pos[None, ...] # add batch dim HWC -> NHWC
-    
-    def create_sinusoidal_rope_pos(self):
-        # theta pos for sine and cosine rope
-        pos = create_sinusoidal_positions_fn(
-            num_pos=self.diffusion_timesteps,
-            dim=self.embed_dim,
-        )
-        return pos
 
 
     def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None):
@@ -435,6 +441,7 @@ class DiTBLockContinuous(nn.Module):
     latent_size: int = 8
     pixel_based: bool = False
     random_fourier_features: bool = False
+    use_rope: bool = True
 
     def setup(self):
         
@@ -508,8 +515,8 @@ class DiTBLockContinuous(nn.Module):
             )
 
         
-    def create_2d_sinusoidal_pos(self, width_len=8, height_len=8):
-        pos = create_2d_sinusoidal_positions_fn(self.embed_dim, width_len, freq_scale=None, relative_center=False, for_rope=False)
+    def create_2d_sinusoidal_pos(self, width_len=8, use_rope=True):
+        pos = create_2d_sinusoidal_positions_fn(self.embed_dim * self.attn_expansion_factor // self.n_heads, width_len, freq_scale=None, relative_center=use_rope)
         # pos = create_2d_sinusoidal_positions_fn(
         #     width_len=width_len, 
         #     height_len=height_len, 
@@ -518,43 +525,34 @@ class DiTBLockContinuous(nn.Module):
         #     epsilon=self.eps
         # )
         return pos[None, ...] # add batch dim HWC -> NHWC
-    
-    def create_sinusoidal_rope_pos(self):
-        # theta pos for sine and cosine rope
-        pos = create_sinusoidal_positions_fn(
-            num_pos=self.diffusion_timesteps,
-            dim=self.embed_dim,
-        )
-        return pos
-
 
     def sigma_scaling(self, timesteps):
         # this is karras preconditioning formula to help the model stays in unit variance
         # better alternatives than replacing the noise from standard gaussian to have unit variance 
         c_skip = self.sigma_data ** 2 / (timesteps ** 2 + self.sigma_data ** 2)
         c_out = timesteps * self.sigma_data / (timesteps ** 2 + self.sigma_data ** 2) ** 0.5
-        c_in = 1 / (timesteps ** 2 + self.sigma_data ** 2) ** 0.
+        c_in = 1 / (timesteps ** 2 + self.sigma_data ** 2) ** 0.5
         # reweight loss so it focus more on low frequency denoising part
         soft_weighting = (timesteps * self.sigma_data) ** 2 / (timesteps ** 2 + self.sigma_data ** 2) ** 2
         return c_skip, c_out, c_in, soft_weighting
 
 
-    def loss(self, rng_key, model_apply_fn, images, timesteps, conds, image_pos=None, extra_pos=None):
-        c_skip, c_out, c_in, soft_weighting = self.sigma_scaling(timesteps)
+    def loss(self, rng_key, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None):
+        c_skip, c_out, c_in, soft_weighting = [scale[:, None, None, None] for scale in self.sigma_scaling(timesteps)]
         noises = jax.random.normal(key=rng_key, shape=images.shape)
-        noised_images = (images + noises * timesteps) * c_in
-        model_predictions = model_apply_fn(noised_images, timesteps, conds, image_pos, extra_pos)
+        noised_images = (images + noises * timesteps[:, None, None, None])
+        model_predictions = model_apply_fn(model_params, noised_images * c_in, timesteps, conds, image_pos, extra_pos)
         # target "noise"
         # this scaling has interesting dynamics if you print out the image
         # mainly the model returned a prediction based on frequency that remains after noise is added
         target_predictions = (images - noised_images * c_skip)/c_out
-        loss = jnp.mean((model_predictions-target_predictions)** 2) * soft_weighting
-        return loss
+        loss = jnp.mean((model_predictions-target_predictions)** 2, axis=[1,2,3]) * soft_weighting.reshape(-1)
+        return jnp.mean(loss), (model_predictions, target_predictions, model_predictions - target_predictions, noised_images, images)  # flatten
 
 
-    def pred(self, model_apply_fn, images, timesteps, conds, image_pos=None, extra_pos=None):
-        c_skip, c_out, c_in, _ = self.sigma_scaling(timesteps)
-        return model_apply_fn(images * c_in, timesteps, conds, image_pos, extra_pos) * c_out + images * c_skip
+    def pred(self, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None):
+        c_skip, c_out, c_in, _ = [scale[:, None, None, None] for scale in self.sigma_scaling(timesteps)]
+        return model_apply_fn(model_params, images * c_in, timesteps, conds, image_pos, extra_pos) * c_out + images * c_skip
         
 
     def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None):
@@ -564,39 +562,28 @@ class DiTBLockContinuous(nn.Module):
         n, h, w, c = x.shape
         x = rearrange(x, "n h w c-> n (h w) c")
         x = self.linear_proj_input(x)
-        # use default image position latent if not provided
-        if self.latent_size is not None:
-            x = x + jax.lax.stop_gradient(self.latent_positional_embedding)
-        else:
-            x = x + image_pos
-        
+
         # time loop 
-        time = self.time_embed(timestep)[:,None,:] # grab the time
-        if self.n_class is not None:
+        time = self.time_embed(timestep[:,None])[:,None,:] # grab the time
+        if self.n_class and cond is not None :
             class_cond = self.class_embed(cond)[:,None,:]
             cond = time + class_cond
+        else:
+            cond = time 
         # mebbe ditching this loop is simpler 
         # simple time embedding vector should suffice
         # silly ideas, rescale the input vector relative to this 
         # so the model pay more attention to the timesteps or class
         for glu_time in self.time_embedding_stack:
             cond = glu_time(cond)
-        cond = nn.silu(cond)
+        # jax.debug.print("max,{max} min,{min} mean,{mean}", max=cond.max(), min=cond.min(), mean=cond.mean())
 
-        # TODO: add rope
-
-        # if self.n_class is not None:
-        #     x = jnp.concatenate([time, class_cond, x], axis=-2) # put time embedding in the seq dim
-        # else:
-        #     x = jnp.concatenate([time, x], axis=-2) # put time embedding in the seq dim
         # attention block loop
         for attn, glu in self.dit_blocks:
-            x = attn(x, cond, extra_pos) # NOTE: if using this pos put image token in 1 position!
+            x = attn(x, cond, jax.lax.stop_gradient(self.latent_positional_embedding) if self.use_rope else None)
             x = glu(x, cond)
-        # if self.n_class is not None:
-        #     x = x[:,2:,:] # pop time and class embedding
-        # else:
-        #     x = x[:,1:,:] # pop time embedding
+        # jax.debug.print("X max,{max} min,{min} mean,{mean}", max=x.max(), min=x.min(), mean=x.mean())
+
         x = self.final_norm(x)
         scale, shift = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=2)
         x = embedding_modulation(x, scale, shift)

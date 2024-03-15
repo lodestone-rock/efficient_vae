@@ -16,6 +16,7 @@ from tqdm import tqdm
 import wandb
 import jmp
 import cv2
+import dm_pix as pix
 
 from vae import Decoder, Encoder, Discriminator, UNetDiscriminator
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
@@ -51,29 +52,29 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         enc_rng, dec_rng, disc_rng, lpips_rng = jax.random.split(jax.random.PRNGKey(seed), 4)
 
         enc = Encoder(
-            output_features = 768,
+            output_features = 256,
             down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (128, 256, 512, 512, 1024),
+            down_layer_dim = (128, 256, 512, 512, 512),
             down_layer_kernel_size = ( 3, 3, 3, 3, 3),
             down_layer_blocks = (4, 4, 4, 4, 2),
-            down_layer_ordinary_conv = (True, True, True, True, False),
+            down_layer_ordinary_conv = (True, True, True, True, True),
             down_layer_residual = (True, True, True, True, True),
             use_bias = False,
-            conv_expansion_factor = (1, 1, 1, 1, 2),
+            conv_expansion_factor = (1, 1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
-            last_layer = "linear",
+            last_layer = "conv",
         )
         dec = Decoder(
             output_features = 3,
             up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (1024, 512, 512, 256, 128),
+            up_layer_dim = (512, 512, 512, 256, 128),
             up_layer_kernel_size = ( 3, 3, 3, 3, 3),
             up_layer_blocks = (2, 4, 4, 4, 4),
-            up_layer_ordinary_conv = (False, True, True, True, True),
+            up_layer_ordinary_conv = (True, True, True, True, True),
             up_layer_residual = (True, True, True, True, True),
             use_bias = True,
-            conv_expansion_factor = (2, 1, 1, 1, 1),
+            conv_expansion_factor = (1, 1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
         )
@@ -123,8 +124,9 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         # decoder
         dummy_latent = enc.apply(enc_params, image)
         # TODO: replace this CPU forward with proper empty latent tensor
-        dummy_latent_mean, dummy_latent_log_var = rearrange(dummy_latent, "n h w (c split) -> split n h w c", split=2)
-        dec_params = dec.init(dec_rng, dummy_latent_mean)
+        # dummy_latent_mean, dummy_latent_log_var = rearrange(dummy_latent, "n h w (c split) -> split n h w c", split=2)
+        dummy_latent = jnp.ones((batch_size, training_res // 32, training_res // 32, 256))
+        dec_params = dec.init(dec_rng, dummy_latent)
         # discriminator
         disc_params = disc.init(disc_rng, image)
         # LPIPS VGG16
@@ -482,7 +484,7 @@ def main():
     GAN_TRAINING_START= 0
     NO_GAN = True
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "final"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
+    WANDB_RUN_NAME = "final_med"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -563,9 +565,12 @@ def main():
                 else:
                     LOSS_SCALE["toggle_gan"] = 0 
 
-                batch = batch / 255 * 2 - 1
 
                 batch[0] = rando_colours(IMAGE_RES)
+                batch_og = batch / 255 * 2 - 1
+
+                batch_blur = pix.gaussian_blur(batch_og, 1, 3)
+                batch = jnp.clip(batch_og + (batch_og - batch_blur) * 3, -1, 1)
 
                 batch = jax.tree_map(
                     lambda leaf: jax.device_put(
@@ -586,23 +591,31 @@ def main():
                     stats_rounded = {key: round(value, 3) for (key, value) in stats.items()}
 
                     preview_test = inference(models, sample_image)
-                    preview = jnp.concatenate([batch[:4], output[:4], preview_test[:4]], axis = 0)
+                    preview = jnp.concatenate([batch_og[:4], output[:4], preview_test[:4]], axis = 0)
+                    preview = jnp.clip(preview, -1, 1)
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                    create_image_mosaic(preview, 3, len(preview)//3, f"{STEPS}.png")
+                    create_image_mosaic(preview, 3, len(preview)//3, f"output/{STEPS}.png")
+
+                    preview = jnp.concatenate([batch[:4], output[:4], preview_test[:4]], axis = 0)
+                    preview = jnp.clip(preview, -1, 1)
+                    preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
+
+                    create_image_mosaic(preview, 3, len(preview)//3, f"output_scaled/{STEPS}.png")
+                    # progress_bar.set_description(f"{stats_rounded}")
                     # progress_bar.set_description(f"{stats_rounded}")
 
 
                 # save every n steps
                 if i % SAVE_EVERY == 0:
                     preview_test = inference(models, sample_image)
-                    preview = jnp.concatenate([batch[:4], output[:4], preview_test[:4]], axis = 0)
+                    preview = jnp.concatenate([batch_og[:4], output[:4], preview_test[:4]], axis = 0)
+                    preview = jnp.clip(preview, -1, 1)
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                    create_image_mosaic(preview, 3, len(preview)//3, f"{STEPS}.png")
-                    wandb.log({"image": wandb.Image(f'{STEPS}.png')}, step=STEPS)
 
-                    ckpt_manager.save(STEPS, models)
+                    create_image_mosaic(preview, 3, len(preview)//3, f"output/{STEPS}.png")
+                    wandb.log({"image": wandb.Image(f'output/{STEPS}.png')}, step=STEPS)
 
 
                 progress_bar.update(1)
