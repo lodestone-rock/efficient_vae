@@ -10,5 +10,5 @@ lpips-j
 orbax
 tqdm
 wandb
-diffusers
+datasets
 # manually install jax!

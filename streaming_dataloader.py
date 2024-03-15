@@ -207,6 +207,49 @@ class SquareImageNetDataset():
         
         return sample
 
+
+class OxfordFlowersDataset():
+    def __init__(self, square_size=50, seed=84):
+        from datasets import load_dataset
+        train_set = load_dataset("nelorth/oxford-flowers")
+        self.images = [np.array(image) for image in train_set["train"]["image"]]
+        self.labels = [np.array(label) for label in train_set["train"]["label"]]
+        self.square_size = square_size
+        random.seed(seed)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        sample = {}
+        try:
+            image = self.images[idx]
+            
+            if image.shape[-1] != 3:
+                raise "image has more than 3 channel"
+            # Calculate the dimensions for center crop
+            height, width = image.shape[:2]
+            crop_size = min(height, width)
+            top = (height - crop_size) // 2
+            left = (width - crop_size) // 2
+            bottom = top + crop_size
+            right = left + crop_size
+
+            # Perform center crop using NumPy array slicing
+            image = image[top:bottom, left:right]
+            image = cv2.resize(image, (self.square_size, self.square_size), interpolation=cv2.INTER_AREA)
+
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            sample["image"] = image
+
+            sample["label"] = self.labels[idx]
+
+        except Exception as e:
+            return self.__getitem__(random.randrange(0, len(self.file_list)))
+        
+        return sample
+
+
 def rando_colours(IMAGE_RES):
     
     max_colour = np.full([1, IMAGE_RES, IMAGE_RES, 1], 255)
@@ -269,6 +312,10 @@ def collate_labeled_imagenet_fn(batch):
         "labels": np.stack(labels, axis=0),
     }
 
+
+# dataset = OxfordFlowersDataset(square_size=256, seed=1)
+# t_dl = threading_dataloader(dataset, batch_size=128, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=1)
 # x = SquareImageNetDataset("ramdisk/train_images",square_size=512)
 # x[0]
 # print()
+

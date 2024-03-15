@@ -54,13 +54,13 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         enc = Encoder(
             output_features = 256,
             down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (128, 256, 512, 512, 512),
+            down_layer_dim = (128, 256, 256, 256, 256),
             down_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            down_layer_blocks = (4, 4, 4, 4, 2),
+            down_layer_blocks = (4, 4, 4, 4, 4),
             down_layer_ordinary_conv = (True, True, True, True, True),
             down_layer_residual = (True, True, True, True, True),
             use_bias = False,
-            conv_expansion_factor = (1, 1, 1, 1, 1),
+            conv_expansion_factor = (1, 1, 1, 1, 2),
             eps = 1e-6,
             group_count = 16,
             last_layer = "conv",
@@ -68,9 +68,9 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         dec = Decoder(
             output_features = 3,
             up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (512, 512, 512, 256, 128),
+            up_layer_dim = (256, 256, 256, 256, 128),
             up_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            up_layer_blocks = (2, 4, 4, 4, 4),
+            up_layer_blocks = (4, 4, 4, 4, 4),
             up_layer_ordinary_conv = (True, True, True, True, True),
             up_layer_residual = (True, True, True, True, True),
             use_bias = True,
@@ -471,7 +471,7 @@ def main():
     SAVE_MODEL_PATH = "vae_ckpt"
     IMAGE_RES = 256
     SAVE_EVERY = 500
-    LEARNING_RATE = 2e-4
+    LEARNING_RATE = 1e-3
     LOSS_SCALE = {
         "mse_loss_scale": 1,
         "mae_loss_scale": 0,
@@ -484,7 +484,7 @@ def main():
     GAN_TRAINING_START= 0
     NO_GAN = True
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "final_med"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
+    WANDB_RUN_NAME = "small"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -616,6 +616,8 @@ def main():
 
                     create_image_mosaic(preview, 3, len(preview)//3, f"output/{STEPS}.png")
                     wandb.log({"image": wandb.Image(f'output/{STEPS}.png')}, step=STEPS)
+
+                    ckpt_manager.save(STEPS, models)
 
 
                 progress_bar.update(1)

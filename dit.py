@@ -426,6 +426,7 @@ class DiTBLockContinuous(nn.Module):
     sigma_data: float = 0.5
 
     embed_dim: int = 768
+    output_dim: int = 256
 
     attn_expansion_factor: int = 2
     glu_expansion_factor: int = 4
@@ -510,7 +511,7 @@ class DiTBLockContinuous(nn.Module):
             )
         else:
             self.output = nn.Dense(
-                features=self.embed_dim, 
+                features=self.output_dim, 
                 use_bias=self.use_bias
             )
 
