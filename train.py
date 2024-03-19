@@ -52,29 +52,29 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         enc_rng, dec_rng, disc_rng, lpips_rng = jax.random.split(jax.random.PRNGKey(seed), 4)
 
         enc = Encoder(
-            output_features = 256,
-            down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (128, 256, 256, 256, 256),
-            down_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            down_layer_blocks = (4, 4, 4, 4, 4),
-            down_layer_ordinary_conv = (True, True, True, True, True),
-            down_layer_residual = (True, True, True, True, True),
+            output_features = 64,
+            down_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2)),
+            down_layer_dim = (128, 128, 128, 256), # deliberate expansion at the bottleneck
+            down_layer_kernel_size = ( 3, 3, 3, 3),
+            down_layer_blocks = (4, 4, 4, 4),
+            down_layer_ordinary_conv = (True, True, True, True),
+            down_layer_residual = (True, True, True, True),
             use_bias = False,
-            conv_expansion_factor = (1, 1, 1, 1, 2),
+            conv_expansion_factor = (1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
             last_layer = "conv",
         )
         dec = Decoder(
             output_features = 3,
-            up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (256, 256, 256, 256, 128),
-            up_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            up_layer_blocks = (4, 4, 4, 4, 4),
-            up_layer_ordinary_conv = (True, True, True, True, True),
-            up_layer_residual = (True, True, True, True, True),
+            up_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2)),
+            up_layer_dim = (256, 128, 128, 128), # deliberate expansion at the bottleneck
+            up_layer_kernel_size = ( 3, 3, 3, 3),
+            up_layer_blocks = (4, 4, 4, 4),
+            up_layer_ordinary_conv = (True, True, True, True),
+            up_layer_residual = (True, True, True, True),
             use_bias = True,
-            conv_expansion_factor = (1, 1, 1, 1, 1),
+            conv_expansion_factor = (1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
         )
@@ -125,7 +125,7 @@ def init_model(batch_size = 256, training_res = 256, seed = 42, learning_rate = 
         dummy_latent = enc.apply(enc_params, image)
         # TODO: replace this CPU forward with proper empty latent tensor
         # dummy_latent_mean, dummy_latent_log_var = rearrange(dummy_latent, "n h w (c split) -> split n h w c", split=2)
-        dummy_latent = jnp.ones((batch_size, training_res // 32, training_res // 32, 256))
+        dummy_latent = jnp.ones((batch_size, training_res // 16, training_res // 16, 64))
         dec_params = dec.init(dec_rng, dummy_latent)
         # discriminator
         disc_params = disc.init(disc_rng, image)
@@ -465,13 +465,13 @@ def inference(models, batch):
     return dec_state.apply_fn(dec_params, sample)
 
 def main():
-    BATCH_SIZE = 128
+    BATCH_SIZE = 256
     SEED = 0
     URL_TXT = "datacomp_1b.txt"
-    SAVE_MODEL_PATH = "vae_ckpt"
+    SAVE_MODEL_PATH = "vae_small_ckpt"
     IMAGE_RES = 256
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 1e-4
     LOSS_SCALE = {
         "mse_loss_scale": 1,
         "mae_loss_scale": 0,
@@ -484,7 +484,7 @@ def main():
     GAN_TRAINING_START= 0
     NO_GAN = True
     WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "small"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
+    WANDB_RUN_NAME = "test"#"kl[1e-6]_lpips[0.25]_mse[1]_mae[0]_lr[1e-4]_b1[0.5]_b2[0.9]_gn[32]_c[768]_imagenet-1k"
     WANDB_LOG_INTERVAL = 100
 
     # wandb logging
@@ -509,7 +509,7 @@ def main():
 
     # Remove newline characters from each line and create a list
     parquet_urls = [parquet_url.strip() for parquet_url in parquet_urls]
-    parquet_urls = ["ramdisk/train_images"] * 10
+    parquet_urls = ["ramdisk/train_images"] * 100
 
     def rando_colours(IMAGE_RES):
         

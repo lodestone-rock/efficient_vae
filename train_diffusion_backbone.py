@@ -58,34 +58,34 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
 
         enc = Encoder(
             output_features = latent_depth,
-            down_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            down_layer_dim = (128, 256, 256, 256, 256),
-            down_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            down_layer_blocks = (4, 4, 4, 4, 4),
-            down_layer_ordinary_conv = (True, True, True, True, True),
-            down_layer_residual = (True, True, True, True, True),
+            down_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2)),
+            down_layer_dim = (128, 128, 128, 256), # deliberate expansion at the bottleneck
+            down_layer_kernel_size = ( 3, 3, 3, 3),
+            down_layer_blocks = (4, 4, 4, 4),
+            down_layer_ordinary_conv = (True, True, True, True),
+            down_layer_residual = (True, True, True, True),
             use_bias = False,
-            conv_expansion_factor = (1, 1, 1, 1, 2),
+            conv_expansion_factor = (1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
             last_layer = "conv",
         )
         dec = Decoder(
             output_features = 3,
-            up_layer_contraction_factor = ( (2, 2), (2, 2), (2, 2), (2, 2), (2, 2)),
-            up_layer_dim = (256, 256, 256, 256, 128),
-            up_layer_kernel_size = ( 3, 3, 3, 3, 3),
-            up_layer_blocks = (4, 4, 4, 4, 4),
-            up_layer_ordinary_conv = (True, True, True, True, True),
-            up_layer_residual = (True, True, True, True, True),
+            up_layer_contraction_factor = ((2, 2), (2, 2), (2, 2), (2, 2)),
+            up_layer_dim = (256, 128, 128, 128), # deliberate expansion at the bottleneck
+            up_layer_kernel_size = ( 3, 3, 3, 3),
+            up_layer_blocks = (4, 4, 4, 4),
+            up_layer_ordinary_conv = (True, True, True, True),
+            up_layer_residual = (True, True, True, True),
             use_bias = True,
-            conv_expansion_factor = (1, 1, 1, 1, 1),
+            conv_expansion_factor = (1, 1, 1, 1),
             eps = 1e-6,
             group_count = 16,
         )
 
         dit_backbone = DiTBLockContinuous(
-            n_layers=16, 
+            n_layers=8, 
             embed_dim=512, 
             output_dim=latent_depth,
             n_heads=8, 
@@ -108,7 +108,7 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         timesteps = jnp.ones([batch_size]).astype(jnp.int32)
         conds = jnp.ones([batch_size]).astype(jnp.int32)
         #  x, timestep, cond=None, image_pos=None, extra_pos=None
-        dit_params = dit_backbone.init(dit_rng, dummy_latent, timesteps, conds)
+        dit_params = dit_backbone.init(dit_rng, dummy_latent, timesteps, conds, toggle_cond=conds)
         # load vae ckpt
         vae_manager = checkpoint_manager(pretrained_vae_ckpt,2)
         raw_restored = vae_manager.restore(directory=os.path.abspath(pretrained_vae_ckpt), step=vae_ckpt_steps)
@@ -161,6 +161,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             loss: Callable = struct.field(pytree_node=False)
             pred: Callable = struct.field(pytree_node=False)
             sigma_data: float = struct.field(pytree_node=False)
+            rectified_flow_loss: Callable = struct.field(pytree_node=False)
+            pred_rectified_flow: Callable = struct.field(pytree_node=False)
 
 
         # do not apply weight decay to norm layer
@@ -172,7 +174,9 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
                 jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", dit_params)
             ),
             loss=dit_backbone.loss,
+            rectified_flow_loss=dit_backbone.rectified_flow_loss,
             pred=dit_backbone.pred,
+            pred_rectified_flow=dit_backbone.pred_rectified_flow,
             sigma_data=dit_backbone.sigma_data
 
         )
@@ -339,6 +343,57 @@ def train_edm_based(dit_state, batch, train_rng):
 
 
 # @jax.jit
+def train_flow_based(dit_state, batch, train_rng):
+
+    # always create new RNG!
+    sample_rng, new_train_rng = jax.random.split(train_rng, num=2)
+    
+    # unpack
+
+    def _compute_loss(
+        dit_params, batch, rng_key
+    ):
+        dit_params, batch = mixed_precision_policy.cast_to_compute((dit_params, batch))
+    
+        images = batch["images"]
+        class_cond = batch["labels"]
+        n, h, w, c = images.shape      
+
+        # Sample noise that we'll add to the images
+        # I think I should combine this with the first noise seed generator
+        noise_rng, timestep_rng, cond = jax.random.split(
+            key=rng_key, num=3
+        )
+        timesteps = jax.numpy.sort(jax.random.uniform(timestep_rng, [n])) 
+        toggle_cond = jax.random.choice(cond,2,[n])
+        # rng_key, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None
+        loss, debug_image = dit_state.rectified_flow_loss(noise_rng, dit_state.apply_fn, dit_params, images, timesteps, class_cond, toggle_cond=toggle_cond)
+
+        return mixed_precision_policy.cast_to_output(loss), debug_image
+
+    grad_fn = jax.value_and_grad(
+        fun=_compute_loss, argnums=[0,], has_aux=True  # differentiate first param only
+    )
+
+    (loss, debug_image), grad = grad_fn(
+        dit_state.params,
+        batch, 
+        sample_rng,
+    )
+    # update weight and bias value
+    dit_state = dit_state.apply_gradients(grads=jmp.cast_to_full(grad[0]))
+
+    # calculate loss
+    metrics = {"mse_loss": loss}
+    return (
+        dit_state,
+        metrics,
+        new_train_rng,
+        debug_image
+    )
+
+
+# @jax.jit
 def edm_sampler(key,
     model, latents, class_labels=None,
     num_steps=200, sigma_min=0.001, sigma_max=1000, rho=7,
@@ -375,22 +430,59 @@ def edm_sampler(key,
     return x_next
 
 
+def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  model_apply_fn=None, cfg_scale=None):
+    """
+    Euler method solver for ODE: dZ/dt = v(Z, t)
+
+    Parameters:
+        func: Function representing dZ/dt = v(Z, t)
+        Z0: Initial condition for Z
+        t_span: Tuple (t0, tf) specifying initial and final time
+        dt: Step size
+
+    Returns:
+        Z: Array of approximated solutions
+        t: Array of time points
+    """
+    t0, tf = t_span
+    num_steps = abs(int((tf - t0) / dt) + 1)  # Number of time steps
+    t = jnp.linspace(t0, tf, num_steps)   # Time array
+    Z = init_cond
+    toggle_cond_on = jnp.ones_like(conds)
+    toggle_cond_off = jnp.zeros_like(conds)
+
+    # wraps model vector CFG
+    def _func_cfg(init_cond, t, conds, model_params, model_apply_fn):
+        cond_vector = func(init_cond, t, conds=conds, model_params=model_params,  model_apply_fn=model_apply_fn, toggle_cond=toggle_cond_on)
+        uncond_vector = func(init_cond, t, conds=conds, model_params=model_params,  model_apply_fn=model_apply_fn, toggle_cond=toggle_cond_off)
+        return uncond_vector + (cond_vector - uncond_vector) * cfg_scale
+
+
+    # Euler method iteration
+    for i in range(1, num_steps):
+        Z = Z - _func_cfg(Z, t[i - 1][None], conds=conds, model_params=model_params,  model_apply_fn=model_apply_fn) * dt
+
+
+    return Z
+
+
 def main():
-    BATCH_SIZE = 128
+    BATCH_SIZE = 32
     SEED = 0
-    SAVE_MODEL_PATH = "dit_ckpt"
+    SAVE_MODEL_PATH = "dit_ckpt_imagenet"
     IMAGE_RES = 512
-    LATENT_RATIO = 32
+    LATENT_RATIO = 16
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 5e-4
     WANDB_PROJECT_NAME = "DiT"
-    WANDB_RUN_NAME = "oxford_flowers"
+    WANDB_RUN_NAME = "imagenet"
     WANDB_LOG_INTERVAL = 100
     LATENT_BASED = True
-    VAE_CKPT_STEPS = 99510
-    VAE_CKPT = "vae_ckpt"
-    LATENT_DEPTH = 256
-    IMAGE_OUTPUT_PATH = "dit_output_training"
+    VAE_CKPT_STEPS = 45465
+    VAE_CKPT = "vae_small_ckpt"
+    LATENT_DEPTH = 64
+    IMAGE_OUTPUT_PATH = "dit_output"
+    IMAGE_PATH = "ramdisk/train_images"
 
     # wandb logging
     if WANDB_PROJECT_NAME:
@@ -415,14 +507,12 @@ def main():
 
 
     # Open the text file in read mode
-    image_paths = ["ramdisk/train_images"] * 1000000
-    dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
     STEPS = 0
+    dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
+    # dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
     try:
-        for image_path in image_paths:
+        while True:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
-            # dataset = SquareImageNetDataset(image_path, square_size=IMAGE_RES, seed=STEPS)
-            
             t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=SEED)
             # Initialize the progress bar
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
@@ -459,39 +549,51 @@ def main():
                     batch["images"], _ = rearrange(jax.jit(enc_state.call)(enc_state.params, batch["images"]), "b h w (c split) -> split b h w c", split = 2)
 
                 # dit_state, metrics, train_rng = train_pixel_based(dit_state, frozen_training_state, batch, train_rng)
-                if STEPS % 100 == 0:
-                    dit_state, metrics, train_rng, debug_image = train_edm_based(dit_state, batch, train_rng)
-                else:
-                    dit_state, metrics, train_rng, debug_image = jax.jit(train_edm_based)(dit_state, batch, train_rng)
+                # if STEPS % 100 == 0:
+                # #     # dit_state, metrics, train_rng, debug_image = train_edm_based(dit_state, batch, train_rng)
+                #     dit_state, metrics, train_rng, debug_image = train_flow_based(dit_state, batch, train_rng)
+                # else:
+                #     # dit_state, metrics, train_rng, debug_image = jax.jit(train_edm_based)(dit_state, batch, train_rng)
+                dit_state, metrics, train_rng, debug_image = jax.jit(train_flow_based)(dit_state, batch, train_rng)
                 # dit_state, metrics, train_rng = train(dit_state, frozen_training_state, batch, train_rng)
 
                 if jnp.isnan(metrics["mse_loss"]).any():
                     raise ValueError("The array contains NaN values")
 
-                if STEPS % WANDB_LOG_INTERVAL == 0:
-                    # preview = np.array((jnp.clip(jnp.concatenate(debug_image, axis=0), -1, 1) + 1) / 2 * 255, dtype=np.uint8)
-                    # create_image_mosaic(preview, 5, BATCH_SIZE, f"!DEBUG{STEPS}.png")
-
+                if STEPS % (WANDB_LOG_INTERVAL//10) == 0:
                     progress_bar.set_description(f"{metrics}")
                     wandb.log(metrics, step=STEPS)
+                
+
+                if STEPS % WANDB_LOG_INTERVAL == 0:
+                    # debug_image = jax.jit(dec_state.call)(dec_state.params, jnp.concatenate(debug_image, axis=0))
+                    # debug_image = np.array((jnp.clip(debug_image, -1, 1) + 1) / 2 * 255, dtype=np.uint8)
+                    # create_image_mosaic(debug_image, 4, BATCH_SIZE, f"!DEBUG{STEPS}.png")
+
+                    # wandb.log(metrics, step=STEPS)
+                    progress_bar.set_description(f"{metrics}")
                     network = jax.jit(dit_state.apply_fn) # compile
-                    forward_fn = partial(dit_state.pred, model_params=dit_state.params,  model_apply_fn=network)
-                    preview = edm_sampler(
-                        jax.random.PRNGKey(2), 
-                        forward_fn, 
-                        jax.random.normal(key=jax.random.PRNGKey(2), shape=[BATCH_SIZE//4, IMAGE_RES//LATENT_RATIO, IMAGE_RES//LATENT_RATIO, LATENT_DEPTH]), 
-                        num_steps=30, 
-                        sigma_max=1000
-                    )
+                    # forward_fn = partial(dit_state.pred_rectified_flow, model_params=dit_state.params,  model_apply_fn=network)
+                    # preview = edm_sampler(
+                    #     jax.random.PRNGKey(2), 
+                    #     forward_fn, 
+                    #     jax.random.normal(key=jax.random.PRNGKey(2), shape=[BATCH_SIZE//4, IMAGE_RES//LATENT_RATIO, IMAGE_RES//LATENT_RATIO, LATENT_DEPTH]), 
+                    #     num_steps=30, 
+                    #     sigma_max=1000,
+                    #     class_labels=batch["labels"][:BATCH_SIZE//4],
+                    # )
+                    rand_init = jax.random.normal(key=jax.random.PRNGKey(2), shape=[BATCH_SIZE//4, IMAGE_RES//LATENT_RATIO, IMAGE_RES//LATENT_RATIO, LATENT_DEPTH])
+                    preview = euler_solver(dit_state.pred_rectified_flow, rand_init, (1, 0.001), 0.01, conds=batch["labels"][:BATCH_SIZE//4], model_params=dit_state.params,  model_apply_fn=network, cfg_scale=jnp.array(4))
                     # there has to be a better way to ensure unit variance distribution other than this dum dum clipping
                     preview = jnp.clip(preview, -1, 1)
-                    preview = jax.jit(dec_state.call)(dec_state.params, preview)
+                    if LATENT_BASED:
+                        preview = jax.jit(dec_state.call)(dec_state.params, preview)
                     preview = np.array((jnp.concatenate([preview[:preview.shape[0]//4], batch["og_images"][:BATCH_SIZE//4]][:preview.shape[0]//4], axis=0) + 1) / 2 * 255, dtype=np.uint8)
                     create_image_mosaic(preview, 4,  BATCH_SIZE//8//4, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
 
                 # save every n steps
                 if STEPS % SAVE_EVERY == 0:
-                    wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
+                    # wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
                     ckpt_manager.save(STEPS, models)
 
                 progress_bar.update(1)

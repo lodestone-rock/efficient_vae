@@ -154,7 +154,7 @@ class SelfAttention(nn.Module):
             param_dtype=jnp.float32
         )
         self.cond_projection =  nn.Dense(
-            features=self.embed_dim * 3, 
+            features=self.embed_dim * 2, 
             use_bias=self.use_bias
         )
         # pointwise conv reformulated as matmul
@@ -173,7 +173,7 @@ class SelfAttention(nn.Module):
         # store input as residual identity
         residual = x
         x = self.rms_norm(x)
-        scale, shift, gate = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=3)
+        scale, shift = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=2)
         x = embedding_modulation(x, scale, shift)
         # query, key, value
         q, k, v = rearrange(self.qkv(x), "b l (d split) -> split b l d", split=3)
@@ -210,7 +210,7 @@ class SelfAttention(nn.Module):
             # output projection
             out = rearrange(out, "b l n_head d -> b l (n_head d)")
         x = self.out(out)
-        return  x + residual + gate
+        return  x + residual
     
 
 class GLU(nn.Module):
@@ -228,7 +228,7 @@ class GLU(nn.Module):
         )
         if self.cond:
             self.cond_projection =  nn.Dense(
-                features=self.embed_dim * 3, 
+                features=self.embed_dim * 2, 
                 use_bias=self.use_bias
             )
         # inverted bottleneck with gating
@@ -241,11 +241,11 @@ class GLU(nn.Module):
         residual = x
         x = self.rms_norm(x)
         if self.cond:
-            scale, shift, gate = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=3)
+            scale, shift = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=2)
             x = embedding_modulation(x, scale, shift)
         x = self.down_proj(self.up_proj(x) * nn.silu(self.gate_proj(x)))
         if self.cond:
-            return x + residual + gate
+            return x + residual
         else:
             return x + residual
 
@@ -488,7 +488,7 @@ class DiTBLockContinuous(nn.Module):
 
         # time embedding
         time_embedding_stack = [] 
-        for layer in range(self.n_layers):
+        for layer in range(self.n_time_embed_layers):
             # overkill but eh whatever
             glu_time = GLU(embed_dim=self.embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias, eps=self.eps, cond=False)
 
@@ -499,10 +499,6 @@ class DiTBLockContinuous(nn.Module):
             epsilon=self.eps, 
             dtype=jnp.float32,
             param_dtype=jnp.float32
-        )
-        self.cond_projection =  nn.Dense(
-            features=self.embed_dim * 2, 
-            use_bias=self.use_bias
         )
         if self.pixel_based:
             self.output = nn.Dense(
@@ -517,7 +513,7 @@ class DiTBLockContinuous(nn.Module):
 
         
     def create_2d_sinusoidal_pos(self, width_len=8, use_rope=True):
-        pos = create_2d_sinusoidal_positions_fn(self.embed_dim * self.attn_expansion_factor // self.n_heads, width_len, freq_scale=None, relative_center=use_rope)
+        pos = create_2d_sinusoidal_positions_fn(self.embed_dim * self.attn_expansion_factor // self.n_heads, width_len, freq_scale=None, relative_center=False)
         # pos = create_2d_sinusoidal_positions_fn(
         #     width_len=width_len, 
         #     height_len=height_len, 
@@ -554,9 +550,23 @@ class DiTBLockContinuous(nn.Module):
     def pred(self, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None):
         c_skip, c_out, c_in, _ = [scale[:, None, None, None] for scale in self.sigma_scaling(timesteps)]
         return model_apply_fn(model_params, images * c_in, timesteps, conds, image_pos, extra_pos) * c_out + images * c_skip
-        
 
-    def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None):
+
+    def rectified_flow_loss(self, rng_key, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None, toggle_cond=None):
+        noises = jax.random.normal(key=rng_key, shape=images.shape)
+        noise_to_image_flow = noises * timesteps[:, None, None, None] + images * (1-timesteps[:, None, None, None]) # vector field pointing towards images
+        flow_path = noises - images # noise >>>>towards>>>> image
+        model_trajectory_predictions = model_apply_fn(model_params, noise_to_image_flow, timesteps, conds, image_pos, extra_pos, toggle_cond)
+
+        loss = jnp.mean((model_trajectory_predictions - flow_path)** 2)
+        return loss, (model_trajectory_predictions, model_trajectory_predictions - flow_path, flow_path, images)  # flatten
+    
+    
+    def pred_rectified_flow(self, images, timesteps, conds, model_apply_fn, model_params, image_pos=None, extra_pos=None, toggle_cond=None):
+        return model_apply_fn(model_params, images, timesteps, conds, image_pos, extra_pos, toggle_cond)
+
+
+    def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None, toggle_cond=None):
         # NOTE: flax uses NHWC convention so the entire ops is in NHWC
         # merge height and weight and treat it as a token sequence
         # NHWC => BLD 
@@ -568,7 +578,11 @@ class DiTBLockContinuous(nn.Module):
         time = self.time_embed(timestep[:,None])[:,None,:] # grab the time
         if self.n_class and cond is not None :
             class_cond = self.class_embed(cond)[:,None,:]
-            cond = time + class_cond
+            if toggle_cond is not None:
+                cond = time + class_cond * toggle_cond[:, None, None]
+            else:
+                print("this should not bet executed")
+                cond = time + class_cond
         else:
             cond = time 
         # mebbe ditching this loop is simpler 
@@ -576,6 +590,7 @@ class DiTBLockContinuous(nn.Module):
         # silly ideas, rescale the input vector relative to this 
         # so the model pay more attention to the timesteps or class
         for glu_time in self.time_embedding_stack:
+
             cond = glu_time(cond)
         # jax.debug.print("max,{max} min,{min} mean,{mean}", max=cond.max(), min=cond.min(), mean=cond.mean())
 
@@ -586,8 +601,7 @@ class DiTBLockContinuous(nn.Module):
         # jax.debug.print("X max,{max} min,{min} mean,{mean}", max=x.max(), min=x.min(), mean=x.mean())
 
         x = self.final_norm(x)
-        scale, shift = rearrange(self.cond_projection(cond), "b l (d split) -> split b l d", split=2)
-        x = embedding_modulation(x, scale, shift)
+        # x = embedding_modulation(x, scale, shift)
         x = self.output(x)
         x = rearrange(x, "n (h w) c -> n h w c", h=h)
         return x

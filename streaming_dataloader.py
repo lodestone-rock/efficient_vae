@@ -198,6 +198,11 @@ class SquareImageNetDataset():
             # Perform center crop using NumPy array slicing
             image = image[top:bottom, left:right]
             image = cv2.resize(image, (self.square_size, self.square_size), interpolation=cv2.INTER_AREA)
+            # Generate a random number (0 or 1) to decide whether to flip the image
+            flip_decision = random.randint(0, 1)
+            if flip_decision == 1:
+                image = cv2.flip(image, 1)
+                
             sample["image"] = image
 
             sample["label"] = np.array(list(imgnet_classes.keys()).index(img_name.split("/")[-1].split("_")[0]))
