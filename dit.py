@@ -7,6 +7,25 @@ from typing import Tuple, Tuple
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 import numpy as np
 
+import aqt.jax.v2.flax.aqt_flax as aqt
+import aqt.jax.v2.config as aqt_config
+import flax.linen as nn
+from flax.linen import initializers
+from flax.typing import Initializer
+
+default_kernel_init = initializers.lecun_normal()
+
+### upscale and downscale stuff ###
+# pixel unshuffle
+def space_to_depth(x, h=2, w=2):
+    return rearrange(x, '... (h dh) (w dw) c -> ... h w (c dh dw)', dh=h, dw=w)
+
+
+# pixel shuffle
+def depth_to_space(x, h=2, w=2):
+    return rearrange(x, '... h w (c dh dw) -> ... (h dh) (w dw) c', dh=h, dw=w)
+
+
 # def rand_stratified_cosine(rng_key, batch, sigma_data=1., min_value=1e-3, max_value=1e3):
 #     # do stratified sampling on cosine timesteps, ensuring within each batch 
 #     # it will always has representation for each section of the timesteps
@@ -138,6 +157,23 @@ def embedding_modulation(x, scale, shift):
     # basically applies time embedding and conditional to each input for each layer
     return x * (1 + scale) + shift 
 
+class Dense(nn.Module):
+    features: int 
+    config: aqt_config.DotGeneral = aqt_config.fully_quantized(fwd_bits=8, bwd_bits=8)
+    use_bias: bool = False 
+    kernel_init: Initializer = default_kernel_init
+
+    @nn.compact
+    def __call__(self, x):
+        dot_general = aqt.AqtDotGeneral(self.config)
+        return nn.Dense(
+            dot_general=dot_general, 
+            features=self.features, 
+            use_bias=self.use_bias,
+            kernel_init=self.kernel_init
+        )(x)
+
+
 class SelfAttention(nn.Module):
     n_heads: int = 8
     expansion_factor: int = 1
@@ -153,23 +189,23 @@ class SelfAttention(nn.Module):
             dtype=jnp.float32,
             param_dtype=jnp.float32
         )
-        self.cond_projection =  nn.Dense(
+        self.cond_projection =  Dense(
             features=self.embed_dim * 2, 
             use_bias=self.use_bias
         )
         # pointwise conv reformulated as matmul
-        self.qkv = nn.Dense(
+        self.qkv = Dense(
             features=self.embed_dim * self.expansion_factor * 3, 
             use_bias=self.use_bias
         )
-        self.out = nn.Dense(
+        self.out = Dense(
             features=self.embed_dim, 
             use_bias=self.use_bias,
             kernel_init=jax.nn.initializers.zeros
         )
 
-    def __call__(self, x, cond, pos=None):
-
+    def __call__(self, x, cond, pos=None, og_image_shape=None):
+        n, h, w, c = og_image_shape
         # store input as residual identity
         residual = x
         x = self.rms_norm(x)
@@ -206,6 +242,18 @@ class SelfAttention(nn.Module):
                 # pos is theta angle for rotary embedding
                 q = apply_rotary_pos_emb(q, pos)
                 k = apply_rotary_pos_emb(k, pos)
+
+            # # reduce attention computation
+            # k = rearrange(k, "b (h w) n_head d -> b h w n_head d", h=h)
+            # v = rearrange(v, "b (h w) n_head d -> b h w n_head d", h=h)
+            # # N H W N_HEAD C
+            # # downsample
+            # k = jax.image.resize(k, [n , h//2, w//2, self.n_heads, self.embed_dim // self.n_heads * self.expansion_factor], "linear")
+            # v = jax.image.resize(v, [n , h//2, w//2, self.n_heads, self.embed_dim // self.n_heads * self.expansion_factor], "linear")
+            # # flatten back
+            # k = rearrange(k, "b h w n_head d -> b (h w) n_head d")
+            # v = rearrange(v, "b h w n_head d -> b (h w) n_head d")
+
             out = nn.dot_product_attention(q,k,v)
             # output projection
             out = rearrange(out, "b l n_head d -> b l (n_head d)")
@@ -227,15 +275,15 @@ class GLU(nn.Module):
             param_dtype=jnp.float32
         )
         if self.cond:
-            self.cond_projection =  nn.Dense(
+            self.cond_projection =  Dense(
                 features=self.embed_dim * 2, 
                 use_bias=self.use_bias
             )
         # inverted bottleneck with gating
         # practically mimicing mobilenet except only pointwise conv
-        self.up_proj = nn.Dense(self.embed_dim * self.expansion_factor, use_bias=False)
-        self.gate_proj = nn.Dense(self.embed_dim * self.expansion_factor, use_bias=False)
-        self.down_proj = nn.Dense(self.embed_dim, use_bias=False, kernel_init=jax.nn.initializers.zeros)
+        self.up_proj = Dense(self.embed_dim * self.expansion_factor, use_bias=False)
+        self.gate_proj = Dense(self.embed_dim * self.expansion_factor, use_bias=False)
+        self.down_proj = Dense(self.embed_dim, use_bias=False, kernel_init=jax.nn.initializers.zeros)
 
     def __call__(self, x, cond=None):
         residual = x
@@ -291,7 +339,7 @@ class DiTBLock(nn.Module):
     def setup(self):
         
 
-        self.linear_proj_input = nn.Dense(
+        self.linear_proj_input = Dense(
             features=self.embed_dim, 
             use_bias=self.use_bias
         )
@@ -344,17 +392,17 @@ class DiTBLock(nn.Module):
             dtype=jnp.float32,
             param_dtype=jnp.float32
         )
-        self.cond_projection =  nn.Dense(
+        self.cond_projection =  Dense(
             features=self.embed_dim * 2, 
             use_bias=self.use_bias
         )
         if self.pixel_based:
-            self.output = nn.Dense(
+            self.output = Dense(
                 features=3, 
                 use_bias=self.use_bias
             )
         else:
-            self.output = nn.Dense(
+            self.output = Dense(
                 features=self.embed_dim, 
                 use_bias=self.use_bias
             )
@@ -443,17 +491,18 @@ class DiTBLockContinuous(nn.Module):
     pixel_based: bool = False
     random_fourier_features: bool = False
     use_rope: bool = True
+    patch_size: int = 1
 
     def setup(self):
         
 
-        self.linear_proj_input = nn.Dense(
+        self.linear_proj_input = Dense(
             features=self.embed_dim, 
             use_bias=self.use_bias
         )
 
         if self.latent_size is not None:
-            self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size)
+            self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size // self.patch_size)
         if self.use_flash_attention:
             raise Exception("not supported yet! still have to figure out padding shape")
 
@@ -501,13 +550,13 @@ class DiTBLockContinuous(nn.Module):
             param_dtype=jnp.float32
         )
         if self.pixel_based:
-            self.output = nn.Dense(
-                features=3, 
+            self.output = Dense(
+                features=3 * self.patch_size * 2 if self.patch_size > 1 else 3, 
                 use_bias=self.use_bias
             )
         else:
-            self.output = nn.Dense(
-                features=self.output_dim, 
+            self.output = Dense(
+                features=self.output_dim * self.patch_size * 2 if self.patch_size > 1 else self.output_dim, 
                 use_bias=self.use_bias
             )
 
@@ -570,6 +619,8 @@ class DiTBLockContinuous(nn.Module):
         # NOTE: flax uses NHWC convention so the entire ops is in NHWC
         # merge height and weight and treat it as a token sequence
         # NHWC => BLD 
+        if self.patch_size > 1:
+            x = space_to_depth(x, self.patch_size, self.patch_size)
         n, h, w, c = x.shape
         x = rearrange(x, "n h w c-> n (h w) c")
         x = self.linear_proj_input(x)
@@ -596,7 +647,7 @@ class DiTBLockContinuous(nn.Module):
 
         # attention block loop
         for attn, glu in self.dit_blocks:
-            x = attn(x, cond, jax.lax.stop_gradient(self.latent_positional_embedding) if self.use_rope else None)
+            x = attn(x, cond, jax.lax.stop_gradient(self.latent_positional_embedding) if self.use_rope else None, [n, h, w, c])
             x = glu(x, cond)
         # jax.debug.print("X max,{max} min,{min} mean,{mean}", max=x.max(), min=x.min(), mean=x.mean())
 
@@ -604,6 +655,8 @@ class DiTBLockContinuous(nn.Module):
         # x = embedding_modulation(x, scale, shift)
         x = self.output(x)
         x = rearrange(x, "n (h w) c -> n h w c", h=h)
+        if self.patch_size > 1:
+            x = depth_to_space(x, self.patch_size, self.patch_size)
         return x
 
 

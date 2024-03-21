@@ -20,6 +20,7 @@ import jmp
 import cv2
 from flax import struct
 from typing import Callable
+import dm_pix as pix
 
 from vae import Decoder, Encoder
 from dit import DiTBLockContinuous, rand_stratified_cosine
@@ -51,7 +52,7 @@ def checkpoint_manager(save_path, max_to_keep=2):
     return orbax.checkpoint.CheckpointManager(os.path.abspath(save_path), orbax_checkpointer, options)
 
 
-def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 42, learning_rate = 10e-3, pretrained_vae_ckpt=None, vae_ckpt_steps=1, latent_depth=256):
+def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 42, learning_rate = 10e-3, pretrained_vae_ckpt=None, vae_ckpt_steps=1, latent_depth=256, patch_size=1):
     # TODO: move all hardcoded value as config
     with jax.default_device(jax.devices("cpu")[0]):
         enc_rng, dec_rng, dit_rng = jax.random.split(jax.random.PRNGKey(seed), 3)
@@ -93,7 +94,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             latent_size=training_res // latent_ratio, 
             n_class=1001, # last class is a null class where it's untrained and serve as random vector
             pixel_based=False,
-            attn_expansion_factor=1
+            attn_expansion_factor=1,
+            patch_size=patch_size,
         )
 
         # init model params
@@ -469,19 +471,20 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
 def main():
     BATCH_SIZE = 32
     SEED = 0
-    SAVE_MODEL_PATH = "dit_ckpt_imagenet"
-    IMAGE_RES = 512
+    SAVE_MODEL_PATH = "dit_ckpt"
+    IMAGE_RES = 256
     LATENT_RATIO = 16
     SAVE_EVERY = 500
     LEARNING_RATE = 5e-4
     WANDB_PROJECT_NAME = "DiT"
-    WANDB_RUN_NAME = "imagenet"
+    WANDB_RUN_NAME = "oxford_flowers"
     WANDB_LOG_INTERVAL = 100
     LATENT_BASED = True
-    VAE_CKPT_STEPS = 45465
+    VAE_CKPT_STEPS = 401181
     VAE_CKPT = "vae_small_ckpt"
     LATENT_DEPTH = 64
     IMAGE_OUTPUT_PATH = "dit_output"
+    PATCH_SIZE = 1
     IMAGE_PATH = "ramdisk/train_images"
 
     # wandb logging
@@ -500,7 +503,8 @@ def main():
         vae_ckpt_steps=VAE_CKPT_STEPS, 
         pretrained_vae_ckpt=VAE_CKPT, 
         latent_ratio=LATENT_RATIO,
-        latent_depth=LATENT_DEPTH
+        latent_depth=LATENT_DEPTH,
+        patch_size=PATCH_SIZE,
         )
     # unpack models
     dit_state, enc_state, dec_state = models
@@ -536,6 +540,9 @@ def main():
                     ),
                     batch["images"],
                 )
+                # deliberate inductive bias
+                # if 10 - 0.001 * STEPS > 0.1:
+                #     batch["images"] = pix.gaussian_blur(batch["images"], sigma=10 - 0.001 * STEPS, kernel_size=31)
                 batch["labels"] = jax.tree_map(
                     lambda leaf: jax.device_put(
                         leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel"))
