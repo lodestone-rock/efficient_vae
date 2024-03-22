@@ -86,10 +86,10 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         )
 
         dit_backbone = DiTBLockContinuous(
-            n_layers=8, 
-            embed_dim=512, 
+            n_layers=28, 
+            embed_dim=1152, 
             output_dim=latent_depth,
-            n_heads=8, 
+            n_heads=16, 
             use_flash_attention=False, 
             latent_size=training_res // latent_ratio, 
             n_class=1001, # last class is a null class where it's untrained and serve as random vector
@@ -471,16 +471,16 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
 def main():
     BATCH_SIZE = 32
     SEED = 0
-    SAVE_MODEL_PATH = "dit_ckpt"
+    SAVE_MODEL_PATH = "dit_ckpt_imagenet_xl"
     IMAGE_RES = 256
     LATENT_RATIO = 16
     SAVE_EVERY = 500
-    LEARNING_RATE = 5e-4
+    LEARNING_RATE = 1e-5
     WANDB_PROJECT_NAME = "DiT"
-    WANDB_RUN_NAME = "oxford_flowers"
+    WANDB_RUN_NAME = "imagenet_256_XL"
     WANDB_LOG_INTERVAL = 100
     LATENT_BASED = True
-    VAE_CKPT_STEPS = 401181
+    VAE_CKPT_STEPS = 499105
     VAE_CKPT = "vae_small_ckpt"
     LATENT_DEPTH = 64
     IMAGE_OUTPUT_PATH = "dit_output"
@@ -494,7 +494,7 @@ def main():
     # init seed
     train_rng = jax.random.PRNGKey(SEED)
     # init checkpoint manager
-    ckpt_manager = checkpoint_manager(SAVE_MODEL_PATH)
+    ckpt_manager = checkpoint_manager(SAVE_MODEL_PATH, max_to_keep=4)
     # init models
     models = init_model(
         batch_size=BATCH_SIZE, 
@@ -512,8 +512,8 @@ def main():
 
     # Open the text file in read mode
     STEPS = 0
-    dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
-    # dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
+    # dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
+    dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
     try:
         while True:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
@@ -601,7 +601,7 @@ def main():
                 # save every n steps
                 if STEPS % SAVE_EVERY == 0:
                     # wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
-                    ckpt_manager.save(STEPS, models)
+                    ckpt_manager.save(STEPS, dit_state)
 
                 progress_bar.update(1)
                 STEPS += 1
@@ -609,6 +609,6 @@ def main():
     except KeyboardInterrupt:
         STEPS += 1
         print("Ctrl+C command detected. saving model before exiting...")
-        ckpt_manager.save(STEPS, models)
+        ckpt_manager.save(STEPS, dit_state)
 
 main()
