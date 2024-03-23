@@ -86,8 +86,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         )
 
         dit_backbone = DiTBLockContinuous(
-            n_layers=28, 
-            embed_dim=1152, 
+            n_layers=8, 
+            embed_dim=512, 
             output_dim=latent_depth,
             n_heads=16, 
             use_flash_attention=False, 
@@ -96,6 +96,9 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             pixel_based=False,
             attn_expansion_factor=1,
             patch_size=patch_size,
+            use_rope=True,
+            n_time_embed_layers=3,
+            downsample_kv=True
         )
 
         # init model params
@@ -471,21 +474,24 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
 def main():
     BATCH_SIZE = 32
     SEED = 0
-    SAVE_MODEL_PATH = "dit_ckpt_imagenet_xl"
+    SAVE_MODEL_PATH = "oxford_flowers_DDiT"
     IMAGE_RES = 256
     LATENT_RATIO = 16
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-5
+    LEARNING_RATE = 5e-4
     WANDB_PROJECT_NAME = "DiT"
-    WANDB_RUN_NAME = "imagenet_256_XL"
+    WANDB_RUN_NAME = "oxford_flowers_DDiT"
     WANDB_LOG_INTERVAL = 100
     LATENT_BASED = True
     VAE_CKPT_STEPS = 499105
     VAE_CKPT = "vae_small_ckpt"
     LATENT_DEPTH = 64
-    IMAGE_OUTPUT_PATH = "dit_output"
+    IMAGE_OUTPUT_PATH = "ddit_output_unquant_downsample_kv"
     PATCH_SIZE = 1
     IMAGE_PATH = "ramdisk/train_images"
+
+    if not os.path.exists(IMAGE_OUTPUT_PATH):
+        os.makedirs(IMAGE_OUTPUT_PATH)
 
     # wandb logging
     if WANDB_PROJECT_NAME:
@@ -512,8 +518,8 @@ def main():
 
     # Open the text file in read mode
     STEPS = 0
-    # dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
-    dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
+    dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
+    # dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
     try:
         while True:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)

@@ -167,7 +167,7 @@ class Dense(nn.Module):
     def __call__(self, x):
         dot_general = aqt.AqtDotGeneral(self.config)
         return nn.Dense(
-            dot_general=dot_general, 
+            # dot_general=dot_general, 
             features=self.features, 
             use_bias=self.use_bias,
             kernel_init=self.kernel_init
@@ -181,6 +181,7 @@ class SelfAttention(nn.Module):
     eps:float = 1e-6
     embed_dim: int = 768
     use_flash_attention: bool = False
+    downsample_kv: bool = False
 
     def setup(self):
 
@@ -243,16 +244,17 @@ class SelfAttention(nn.Module):
                 q = apply_rotary_pos_emb(q, pos)
                 k = apply_rotary_pos_emb(k, pos)
 
-            # # reduce attention computation
-            # k = rearrange(k, "b (h w) n_head d -> b h w n_head d", h=h)
-            # v = rearrange(v, "b (h w) n_head d -> b h w n_head d", h=h)
-            # # N H W N_HEAD C
-            # # downsample
-            # k = jax.image.resize(k, [n , h//2, w//2, self.n_heads, self.embed_dim // self.n_heads * self.expansion_factor], "linear")
-            # v = jax.image.resize(v, [n , h//2, w//2, self.n_heads, self.embed_dim // self.n_heads * self.expansion_factor], "linear")
-            # # flatten back
-            # k = rearrange(k, "b h w n_head d -> b (h w) n_head d")
-            # v = rearrange(v, "b h w n_head d -> b (h w) n_head d")
+            if self.downsample_kv:
+                # reduce attention computation
+                k = rearrange(k, "b (h w) n_head d -> b h w n_head d", h=h)
+                v = rearrange(v, "b (h w) n_head d -> b h w n_head d", h=h)
+                # N H W N_HEAD C
+                # downsample
+                k = jax.image.resize(k, [n , h//2, w//2, self.n_heads, self.embed_dim // self.n_heads * self.expansion_factor], "linear")
+                v = jax.image.resize(v, [n , h//2, w//2, self.n_heads, self.embed_dim // self.n_heads * self.expansion_factor], "linear")
+                # flatten back
+                k = rearrange(k, "b h w n_head d -> b (h w) n_head d")
+                v = rearrange(v, "b h w n_head d -> b (h w) n_head d")
 
             out = nn.dot_product_attention(q,k,v)
             # output projection
@@ -370,7 +372,7 @@ class DiTBLock(nn.Module):
                 use_bias=self.use_bias, 
                 eps=self.eps,
                 embed_dim=self.embed_dim,
-                use_flash_attention=self.use_flash_attention
+                use_flash_attention=self.use_flash_attention,
             )
             glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps)
 
@@ -492,6 +494,7 @@ class DiTBLockContinuous(nn.Module):
     random_fourier_features: bool = False
     use_rope: bool = True
     patch_size: int = 1
+    downsample_kv: bool = False
 
     def setup(self):
         
@@ -502,7 +505,7 @@ class DiTBLockContinuous(nn.Module):
         )
 
         if self.latent_size is not None:
-            self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size // self.patch_size)
+            self.latent_positional_embedding = self.create_2d_sinusoidal_pos(self.latent_size // self.patch_size, use_rope=self.use_rope)
         if self.use_flash_attention:
             raise Exception("not supported yet! still have to figure out padding shape")
 
@@ -527,11 +530,18 @@ class DiTBLockContinuous(nn.Module):
                 use_bias=self.use_bias, 
                 eps=self.eps,
                 embed_dim=self.embed_dim,
-                use_flash_attention=self.use_flash_attention
+                use_flash_attention=self.use_flash_attention,
+                downsample_kv=self.downsample_kv,
             )
             glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps)
 
-            dit_blocks.append([attn, glu])
+            scaler_layers = [self.param(f'dense_skip_scaling_{layer}_{0}', nn.initializers.ones, ())]
+            for scaler_layer in range(layer+1):
+                other_layers_scaler = self.param(f'dense_skip_scaling_{layer}_{scaler_layer+1}', nn.initializers.zeros, ())
+                scaler_layers.append(other_layers_scaler)
+            
+
+            dit_blocks.append([attn, glu, scaler_layers])
 
         self.dit_blocks = dit_blocks
 
@@ -562,14 +572,10 @@ class DiTBLockContinuous(nn.Module):
 
         
     def create_2d_sinusoidal_pos(self, width_len=8, use_rope=True):
-        pos = create_2d_sinusoidal_positions_fn(self.embed_dim * self.attn_expansion_factor // self.n_heads, width_len, freq_scale=None, relative_center=False)
-        # pos = create_2d_sinusoidal_positions_fn(
-        #     width_len=width_len, 
-        #     height_len=height_len, 
-        #     dim=self.embed_dim, 
-        #     max_freq=self.embed_dim // 2, 
-        #     epsilon=self.eps
-        # )
+        if use_rope:
+            pos = create_2d_sinusoidal_positions_fn(self.embed_dim * self.attn_expansion_factor // self.n_heads, width_len, freq_scale=None, relative_center=False)
+        else:
+            pos = create_2d_sinusoidal_positions_fn(self.embed_dim // 2 , width_len, freq_scale=None, relative_center=False)
         return pos[None, ...] # add batch dim HWC -> NHWC
 
     def sigma_scaling(self, timesteps):
@@ -625,6 +631,9 @@ class DiTBLockContinuous(nn.Module):
         x = rearrange(x, "n h w c-> n (h w) c")
         x = self.linear_proj_input(x)
 
+        if not self.use_rope:
+            x += jax.lax.stop_gradient(self.latent_positional_embedding)
+
         # time loop 
         time = self.time_embed(timestep[:,None])[:,None,:] # grab the time
         if self.n_class and cond is not None :
@@ -646,9 +655,17 @@ class DiTBLockContinuous(nn.Module):
         # jax.debug.print("max,{max} min,{min} mean,{mean}", max=cond.max(), min=cond.min(), mean=cond.mean())
 
         # attention block loop
-        for attn, glu in self.dit_blocks:
+        # skips
+        skips = [x]
+        for attn, glu, skip_scaler in self.dit_blocks:
             x = attn(x, cond, jax.lax.stop_gradient(self.latent_positional_embedding) if self.use_rope else None, [n, h, w, c])
             x = glu(x, cond)
+            skips.append(x)
+
+            x *= skip_scaler[0]
+            for skip, scaler in zip(skips[1:], skip_scaler[1:]):
+                x += skip * scaler
+
         # jax.debug.print("X max,{max} min,{min} mean,{mean}", max=x.max(), min=x.min(), mean=x.mean())
 
         x = self.final_norm(x)

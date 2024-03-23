@@ -16,4 +16,4 @@ init.sh
 /jax_cache
 *.json
 *.jpg
-/dit_ckpt*
+/*ckpt*
