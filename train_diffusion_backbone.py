@@ -86,8 +86,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         )
 
         dit_backbone = DiTBLockContinuous(
-            n_layers=8, 
-            embed_dim=512, 
+            n_layers=14, 
+            embed_dim=1152, 
             output_dim=latent_depth,
             n_heads=16, 
             use_flash_attention=False, 
@@ -98,7 +98,7 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             patch_size=patch_size,
             use_rope=True,
             n_time_embed_layers=3,
-            downsample_kv=True
+            downsample_kv=False
         )
 
         # init model params
@@ -394,7 +394,7 @@ def train_flow_based(dit_state, batch, train_rng):
         dit_state,
         metrics,
         new_train_rng,
-        debug_image
+        # debug_image
     )
 
 
@@ -472,21 +472,21 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
 
 
 def main():
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     SEED = 0
-    SAVE_MODEL_PATH = "oxford_flowers_DDiT"
+    SAVE_MODEL_PATH = "imagenet_DDiT"
     IMAGE_RES = 256
     LATENT_RATIO = 16
     SAVE_EVERY = 500
-    LEARNING_RATE = 5e-4
-    WANDB_PROJECT_NAME = "DiT"
-    WANDB_RUN_NAME = "oxford_flowers_DDiT"
+    LEARNING_RATE = 1e-4
+    WANDB_PROJECT_NAME = "DDiT"
+    WANDB_RUN_NAME = SAVE_MODEL_PATH
     WANDB_LOG_INTERVAL = 100
     LATENT_BASED = True
     VAE_CKPT_STEPS = 499105
     VAE_CKPT = "vae_small_ckpt"
     LATENT_DEPTH = 64
-    IMAGE_OUTPUT_PATH = "ddit_output_unquant_downsample_kv"
+    IMAGE_OUTPUT_PATH = "ddit_imagenet"
     PATCH_SIZE = 1
     IMAGE_PATH = "ramdisk/train_images"
 
@@ -518,12 +518,12 @@ def main():
 
     # Open the text file in read mode
     STEPS = 0
-    dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
-    # dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
+    # dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
+    dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
     try:
         while True:
             # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
-            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=SEED)
+            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=STEPS+SEED)
             # Initialize the progress bar
             progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
@@ -567,7 +567,7 @@ def main():
                 #     dit_state, metrics, train_rng, debug_image = train_flow_based(dit_state, batch, train_rng)
                 # else:
                 #     # dit_state, metrics, train_rng, debug_image = jax.jit(train_edm_based)(dit_state, batch, train_rng)
-                dit_state, metrics, train_rng, debug_image = jax.jit(train_flow_based)(dit_state, batch, train_rng)
+                dit_state, metrics, train_rng = jax.jit(train_flow_based)(dit_state, batch, train_rng)
                 # dit_state, metrics, train_rng = train(dit_state, frozen_training_state, batch, train_rng)
 
                 if jnp.isnan(metrics["mse_loss"]).any():
@@ -601,12 +601,12 @@ def main():
                     preview = jnp.clip(preview, -1, 1)
                     if LATENT_BASED:
                         preview = jax.jit(dec_state.call)(dec_state.params, preview)
-                    preview = np.array((jnp.concatenate([preview[:preview.shape[0]//4], batch["og_images"][:BATCH_SIZE//4]][:preview.shape[0]//4], axis=0) + 1) / 2 * 255, dtype=np.uint8)
-                    create_image_mosaic(preview, 4,  BATCH_SIZE//8//4, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
+                    preview = np.array((jnp.concatenate([preview[:preview.shape[0]//8], batch["og_images"][:BATCH_SIZE//8]][:preview.shape[0]//8], axis=0) + 1) / 2 * 255, dtype=np.uint8)
+                    create_image_mosaic(preview, 4,  BATCH_SIZE//8//8, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
 
                 # save every n steps
                 if STEPS % SAVE_EVERY == 0:
-                    # wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
+                    wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
                     ckpt_manager.save(STEPS, dit_state)
 
                 progress_bar.update(1)
