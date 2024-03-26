@@ -663,7 +663,7 @@ class DiTBLockContinuous(nn.Module):
             skips.append(x)
 
             x *= skip_scaler[0]
-            for skip, scaler in zip(skips[1:], skip_scaler[1:]):
+            for skip, scaler in zip(skips[:-1], skip_scaler[1:]):
                 x += skip * scaler
 
         # jax.debug.print("X max,{max} min,{min} mean,{mean}", max=x.max(), min=x.min(), mean=x.mean())
