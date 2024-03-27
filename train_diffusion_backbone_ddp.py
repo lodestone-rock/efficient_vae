@@ -2,6 +2,7 @@ import os
 import random
 from functools import partial
 import subprocess
+from safetensors.numpy import save_file, load_file
 
 import flax
 import numpy as np
@@ -133,24 +134,28 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         #  x, timestep, cond=None, image_pos=None, extra_pos=None
         dit_params = dit_backbone.init(dit_rng, dummy_latent, timesteps, conds, toggle_cond=conds)
         # load vae ckpt
-        vae_manager = checkpoint_manager(pretrained_vae_ckpt,2)
-        raw_restored = vae_manager.restore(directory=os.path.abspath(pretrained_vae_ckpt), step=vae_ckpt_steps)
-        if pretrained_vae_ckpt is not None:
-            if vae_ckpt_steps < 100:
-                print("ARE YOU FREAKING SURE THAT VAE IS TRAINED?")
-            # overwrite vae params with pretrained
-            enc_params_flatten = flatten_dict(enc_params)
-            dec_params_flatten = flatten_dict(dec_params)
+        flatten_encoder_params = load_file(f"{pretrained_vae_ckpt}/encoder_5m_f16c64.safetensors")
+        flatten_decoder_params = load_file(f"{pretrained_vae_ckpt}/decoder_5m_f16c64.safetensors")
+        enc_params = unflatten_dict(flatten_encoder_params)
+        dec_params = unflatten_dict(flatten_decoder_params)
+        # vae_manager = checkpoint_manager(pretrained_vae_ckpt,2)
+        # raw_restored = vae_manager.restore(directory=os.path.abspath(pretrained_vae_ckpt), step=vae_ckpt_steps)
+        # if pretrained_vae_ckpt is not None:
+        #     if vae_ckpt_steps < 100:
+        #         print("ARE YOU FREAKING SURE THAT VAE IS TRAINED?")
+        #     # overwrite vae params with pretrained
+        #     enc_params_flatten = flatten_dict(enc_params)
+        #     dec_params_flatten = flatten_dict(dec_params)
 
-            orbax_enc_params_flatten = flatten_dict(raw_restored[0]["params"])
-            orbax_dec_params_flatten = flatten_dict(raw_restored[1]["params"])
+        #     orbax_enc_params_flatten = flatten_dict(raw_restored[0]["params"])
+        #     orbax_dec_params_flatten = flatten_dict(raw_restored[1]["params"])
 
-            enc_params = unflatten_dict({key: orbax_enc_params_flatten[key] for key in enc_params_flatten})
-            dec_params = unflatten_dict({key: orbax_dec_params_flatten[key] for key in dec_params_flatten})
+        #     enc_params = unflatten_dict({key: orbax_enc_params_flatten[key] for key in enc_params_flatten})
+        #     dec_params = unflatten_dict({key: orbax_dec_params_flatten[key] for key in dec_params_flatten})
 
 
-            enc_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices()[0]), enc_params)
-            dec_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices()[0]), dec_params)
+        #     enc_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices()[0]), enc_params)
+        #     dec_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices()[0]), dec_params)
 
         enc_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, enc_params)).values()))
         dec_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, dec_params)).values()))
@@ -655,7 +660,13 @@ def main():
                 if STEPS % SAVE_EVERY == 0:
                     if NODE_INDEX == 0 and WANDB_PROJECT_NAME is not None:
                         wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
-                    ckpt_manager.save(STEPS, jax_utils.unreplicate(dit_state))
+                    ckpt_manager.save(STEPS, {"dummy":"dummy"})
+                    try:
+                        save_file(flatten_dict(jax_utils.unreplicate(dit_state.params)), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
+                        save_file(flatten_dict(jax_utils.unreplicate(dit_state.opt_state[1][0].mu)), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
+                        save_file(flatten_dict(jax_utils.unreplicate(dit_state.opt_state[1][0].nu)), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
+                    except Exception as e:
+                        print(e)
 
                 progress_bar.update(1)
                 STEPS += 1
@@ -663,6 +674,13 @@ def main():
     except KeyboardInterrupt:
         STEPS += 1
         print("Ctrl+C command detected. saving model before exiting...")
-        ckpt_manager.save(STEPS, jax_utils.unreplicate(dit_state))
+        ckpt_manager.save(STEPS, {"dummy":"dummy"})
+        try:
+            save_file(flatten_dict(jax_utils.unreplicate(dit_state.params)), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
+            save_file(flatten_dict(jax_utils.unreplicate(dit_state.opt_state[1][0].mu)), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
+            save_file(flatten_dict(jax_utils.unreplicate(dit_state.opt_state[1][0].nu)), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
+        except Exception as e:
+            print(e)
+
 
 main()

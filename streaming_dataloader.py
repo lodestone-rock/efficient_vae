@@ -79,6 +79,10 @@ def threading_dataloader(dataset, batch_size=1, num_workers=10, collate_fn=None,
             time.sleep(10)
             print("dataloader queue:", prefetch_queue.qsize())
             print("worker queue:", workers._work_queue.qsize())
+            if workers._work_queue.qsize() + prefetch_queue.qsize() == 0:
+                print("all task is done, shutting down threads")
+                overseer.shutdown()
+                workers.shutdown()
 
     # just in case worker submit loop is too slow due to a ton of loops, fork it to another thread so the main thread can continue
     overseer.submit(overseer_thread)

@@ -1,6 +1,7 @@
 import os
 import random
 from functools import partial
+from safetensors.numpy import save_file, load_file
 
 import flax
 import numpy as np
@@ -348,12 +349,17 @@ def train_edm_based(dit_state, batch, train_rng):
 
 
 # @jax.jit
-def train_flow_based(dit_state, batch, train_rng):
+def train_flow_based(dit_state, enc_state, batch, train_rng, LATENT_BASED=True):
 
     # always create new RNG!
-    sample_rng, new_train_rng = jax.random.split(train_rng, num=2)
+    sample_rng, encoder_rng, new_train_rng = jax.random.split(train_rng, num=3)
     
     # unpack
+
+    if LATENT_BASED:
+        # log var is dropped because we dont want to feed noisy latent to the backbone
+        latent_mean, latent_log_var = rearrange(jax.jit(enc_state.call)(enc_state.params, batch["images"]), "b h w (c split) -> split b h w c", split = 2)
+        batch["images"] =  latent_mean + jnp.exp(0.5 * latent_log_var) * jnp.clip((jax.random.normal(encoder_rng, latent_mean.shape)),-1,1)
 
     def _compute_loss(
         dit_params, batch, rng_key
@@ -366,11 +372,11 @@ def train_flow_based(dit_state, batch, train_rng):
 
         # Sample noise that we'll add to the images
         # I think I should combine this with the first noise seed generator
-        noise_rng, timestep_rng, cond = jax.random.split(
+        noise_rng, timestep_rng, cond_rng = jax.random.split(
             key=rng_key, num=3
         )
         timesteps = jax.numpy.sort(jax.random.uniform(timestep_rng, [n])) 
-        toggle_cond = jax.random.choice(cond,2,[n])
+        toggle_cond = jax.random.choice(cond_rng, jnp.array([0, 1]), [n], p=jnp.array([0.1, 0.9]))
         # rng_key, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None
         loss, debug_image = dit_state.rectified_flow_loss(noise_rng, dit_state.apply_fn, dit_params, images, timesteps, class_cond, toggle_cond=toggle_cond)
 
@@ -557,17 +563,13 @@ def main():
                 )
                 batch["og_images"] = batch["images"]
 
-                if LATENT_BASED:
-                    # log var is dropped because we dont want to feed noisy latent to the backbone
-                    batch["images"], _ = rearrange(jax.jit(enc_state.call)(enc_state.params, batch["images"]), "b h w (c split) -> split b h w c", split = 2)
-
                 # dit_state, metrics, train_rng = train_pixel_based(dit_state, frozen_training_state, batch, train_rng)
                 # if STEPS % 100 == 0:
                 # #     # dit_state, metrics, train_rng, debug_image = train_edm_based(dit_state, batch, train_rng)
                 #     dit_state, metrics, train_rng, debug_image = train_flow_based(dit_state, batch, train_rng)
                 # else:
                 #     # dit_state, metrics, train_rng, debug_image = jax.jit(train_edm_based)(dit_state, batch, train_rng)
-                dit_state, metrics, train_rng = jax.jit(train_flow_based)(dit_state, batch, train_rng)
+                dit_state, metrics, train_rng = jax.jit(train_flow_based)(dit_state, enc_state, batch, train_rng)
                 # dit_state, metrics, train_rng = train(dit_state, frozen_training_state, batch, train_rng)
 
                 if jnp.isnan(metrics["mse_loss"]).any():
@@ -607,7 +609,13 @@ def main():
                 # save every n steps
                 if STEPS % SAVE_EVERY == 0:
                     wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
-                    ckpt_manager.save(STEPS, dit_state)
+                    ckpt_manager.save(STEPS, {"dummy":"dummy"})
+                    try:
+                        save_file(flatten_dict(dit_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
+                        save_file(flatten_dict(dit_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
+                        save_file(flatten_dict(dit_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
+                    except Exception as e:
+                        print(e)
 
                 progress_bar.update(1)
                 STEPS += 1
@@ -615,6 +623,12 @@ def main():
     except KeyboardInterrupt:
         STEPS += 1
         print("Ctrl+C command detected. saving model before exiting...")
-        ckpt_manager.save(STEPS, dit_state)
+        ckpt_manager.save(STEPS, {"dummy":"dummy"})
+        try:
+            save_file(flatten_dict(dit_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
+            save_file(flatten_dict(dit_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
+            save_file(flatten_dict(dit_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
+        except Exception as e:
+            print(e)
 
 main()
