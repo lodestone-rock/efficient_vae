@@ -12,4 +12,5 @@ tqdm
 wandb
 datasets
 aqtp
+safetensors
 # manually install jax!
