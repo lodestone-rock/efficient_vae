@@ -232,8 +232,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         #     lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())),
         #     dit_state,
         # )
-        enc_state = jax_utils.replicate(enc_state)
-        dec_state = jax_utils.replicate(dec_state)
+        enc_state = jmp.cast_to_half(jax_utils.replicate(enc_state))
+        dec_state = jmp.cast_to_half(jax_utils.replicate(dec_state))
         dit_state = jax_utils.replicate(dit_state)
 
         return [dit_state, enc_state, dec_state]
@@ -382,6 +382,7 @@ def train_flow_based(dit_state, enc_state, batch, train_rng, LATENT_BASED=True):
     # unpack
     if LATENT_BASED:
         # log var is dropped because we dont want to feed noisy latent to the backbone
+        batch = mixed_precision_policy.cast_to_compute((batch))
         latent_mean, latent_log_var = rearrange(enc_state.call(enc_state.params, batch["images"]), "b h w (c split) -> split b h w c", split = 2)
         batch["images"] =  latent_mean + jnp.exp(0.5 * latent_log_var) * jnp.clip((jax.random.normal(encoder_rng, latent_mean.shape)),-1,1)
 
@@ -492,6 +493,7 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
     # wraps model vector CFG
     def _func_cfg(init_cond, t, conds, model_params, model_apply_fn):
         t = jax_utils.replicate(t)
+        t, model_params, init_cond = jmp.cast_to_half((t, model_params, init_cond))
         cond_vector = func(init_cond, t, conds=conds, model_params=model_params,  model_apply_fn=model_apply_fn, toggle_cond=toggle_cond_on)
         uncond_vector = func(init_cond, t, conds=conds, model_params=model_params,  model_apply_fn=model_apply_fn, toggle_cond=toggle_cond_off)
         return uncond_vector + (cond_vector - uncond_vector) * cfg_scale
@@ -528,7 +530,7 @@ def main():
         os.makedirs(IMAGE_OUTPUT_PATH)
 
     # wandb logging
-    if WANDB_PROJECT_NAME:
+    if WANDB_PROJECT_NAME and NODE_INDEX == 0:
         wandb.init(project=WANDB_PROJECT_NAME, name=WANDB_RUN_NAME)
 
     # init seed
@@ -621,7 +623,7 @@ def main():
                     progress_bar.set_description(f"{mse_loss_stats}")
                     # progress_bar.set_description(f"{metrics}")
                     if NODE_INDEX == 0 and WANDB_PROJECT_NAME is not None:
-                        wandb.log(metrics, step=STEPS)
+                        wandb.log(mse_loss_stats, step=STEPS)
                 
 
                 if STEPS % WANDB_LOG_INTERVAL == 0:
