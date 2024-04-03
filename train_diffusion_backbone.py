@@ -1,6 +1,7 @@
 import os
 import random
 from functools import partial
+import shutil
 from safetensors.numpy import save_file, load_file
 
 import flax
@@ -86,20 +87,27 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             group_count = 16,
         )
 
+        slice = 1
         dit_backbone = DiTBLockContinuous(
-            n_layers=14, 
-            embed_dim=1152, 
+            n_layers=int(12 * slice), 
+            embed_dim=2048, 
+            cond_embed_dim=1024,
             output_dim=latent_depth,
-            n_heads=16, 
+            n_heads=int(32), 
             use_flash_attention=False, 
             latent_size=training_res // latent_ratio, 
-            n_class=1001, # last class is a null class where it's untrained and serve as random vector
+            n_class=1001, 
             pixel_based=False,
-            attn_expansion_factor=1,
+            attn_expansion_factor=1/slice,
+            glu_expansion_factor=2/slice,
+            time_embed_expansion_factor=1,
             patch_size=patch_size,
             use_rope=True,
             n_time_embed_layers=3,
-            downsample_kv=False
+            downsample_kv=False,
+            split_time_embed=1,
+            checkpoint_glu=True,
+            denseformers=True,
         )
 
         # init model params
@@ -478,13 +486,13 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
 
 
 def main():
-    BATCH_SIZE = 256
+    BATCH_SIZE = 256 //2
     SEED = 0
-    SAVE_MODEL_PATH = "imagenet_DDiT"
+    SAVE_MODEL_PATH = "imagenet_DDiT_wide_base_dense"
     IMAGE_RES = 256
     LATENT_RATIO = 16
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-4 /2
     WANDB_PROJECT_NAME = "DDiT"
     WANDB_RUN_NAME = SAVE_MODEL_PATH
     WANDB_LOG_INTERVAL = 100
@@ -495,6 +503,8 @@ def main():
     IMAGE_OUTPUT_PATH = "ddit_imagenet"
     PATCH_SIZE = 1
     IMAGE_PATH = "ramdisk/train_images"
+    MAX_TO_SAVE = 3
+    PERMANENT_EPOCH_STORE = 50000
 
     if not os.path.exists(IMAGE_OUTPUT_PATH):
         os.makedirs(IMAGE_OUTPUT_PATH)
@@ -526,61 +536,62 @@ def main():
     STEPS = 0
     # dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
     dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
-    try:
-        while True:
-            # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
-            t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=STEPS+SEED)
-            # Initialize the progress bar
-            progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
-            for i, batch in enumerate(t_dl):
-                batch_size,_,_,_ = batch["images"].shape
+    while True:
+        # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
+        t_dl = threading_dataloader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=STEPS+SEED)
+        # Initialize the progress bar
+        progress_bar = tqdm(total=len(dataset) // BATCH_SIZE, position=0)
 
-                if batch_size < BATCH_SIZE:
-                    continue
-                # if i > len(dataset) // BATCH_SIZE -10:
-                #     # i should fix my dataloader instead of doing this
-                #     break          
-                # image batch already rescaled inside collate_labeled_imagenet_fn
-                # regularization to flat colours
-                # batch["images"][0] = rando_colours(IMAGE_RES)
-                # batch["labels"][0] = 1000
+        for i, batch in enumerate(t_dl):
+            batch_size,_,_,_ = batch["images"].shape
 
-                batch["images"] = jax.tree_map(
-                    lambda leaf: jax.device_put(
-                        leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel", None, None, None))
-                    ),
-                    batch["images"],
-                )
-                # deliberate inductive bias
-                # if 10 - 0.001 * STEPS > 0.1:
-                #     batch["images"] = pix.gaussian_blur(batch["images"], sigma=10 - 0.001 * STEPS, kernel_size=31)
-                batch["labels"] = jax.tree_map(
-                    lambda leaf: jax.device_put(
-                        leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel"))
-                    ),
-                    batch["labels"],
-                )
-                batch["og_images"] = batch["images"]
+            if batch_size < BATCH_SIZE:
+                continue
+            # if i > len(dataset) // BATCH_SIZE -10:
+            #     # i should fix my dataloader instead of doing this
+            #     break          
+            # image batch already rescaled inside collate_labeled_imagenet_fn
+            # regularization to flat colours
+            # batch["images"][0] = rando_colours(IMAGE_RES)
+            # batch["labels"][0] = 1000
 
-                # dit_state, metrics, train_rng = train_pixel_based(dit_state, frozen_training_state, batch, train_rng)
-                # if STEPS % 100 == 0:
-                # #     # dit_state, metrics, train_rng, debug_image = train_edm_based(dit_state, batch, train_rng)
-                #     dit_state, metrics, train_rng, debug_image = train_flow_based(dit_state, batch, train_rng)
-                # else:
-                #     # dit_state, metrics, train_rng, debug_image = jax.jit(train_edm_based)(dit_state, batch, train_rng)
-                dit_state, metrics, train_rng = jax.jit(train_flow_based)(dit_state, enc_state, batch, train_rng)
-                # dit_state, metrics, train_rng = train(dit_state, frozen_training_state, batch, train_rng)
+            batch["images"] = jax.tree_map(
+                lambda leaf: jax.device_put(
+                    leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel", None, None, None))
+                ),
+                batch["images"],
+            )
+            # deliberate inductive bias
+            # if 10 - 0.001 * STEPS > 0.1:
+            #     batch["images"] = pix.gaussian_blur(batch["images"], sigma=10 - 0.001 * STEPS, kernel_size=31)
+            batch["labels"] = jax.tree_map(
+                lambda leaf: jax.device_put(
+                    leaf, device=NamedSharding(mesh, PartitionSpec("data_parallel"))
+                ),
+                batch["labels"],
+            )
+            batch["og_images"] = batch["images"]
 
-                if jnp.isnan(metrics["mse_loss"]).any():
-                    raise ValueError("The array contains NaN values")
+            # dit_state, metrics, train_rng = train_pixel_based(dit_state, frozen_training_state, batch, train_rng)
+            # if STEPS % 100 == 0:
+            # #     # dit_state, metrics, train_rng, debug_image = train_edm_based(dit_state, batch, train_rng)
+            #     dit_state, metrics, train_rng, debug_image = train_flow_based(dit_state, batch, train_rng)
+            # else:
+            #     # dit_state, metrics, train_rng, debug_image = jax.jit(train_edm_based)(dit_state, batch, train_rng)
+            dit_state, metrics, train_rng = jax.jit(train_flow_based)(dit_state, enc_state, batch, train_rng)
+            # dit_state, metrics, train_rng = train(dit_state, frozen_training_state, batch, train_rng)
 
-                if STEPS % (WANDB_LOG_INTERVAL//10) == 0:
-                    progress_bar.set_description(f"{metrics}")
-                    wandb.log(metrics, step=STEPS)
-                
+            if jnp.isnan(metrics["mse_loss"]).any():
+                raise ValueError("The array contains NaN values")
 
-                if STEPS % WANDB_LOG_INTERVAL == 0:
+            if STEPS % (WANDB_LOG_INTERVAL//10) == 0:
+                progress_bar.set_description(f"{metrics}")
+                wandb.log(metrics, step=STEPS)
+            
+
+            if STEPS % WANDB_LOG_INTERVAL == 0:
+                try:
                     # debug_image = jax.jit(dec_state.call)(dec_state.params, jnp.concatenate(debug_image, axis=0))
                     # debug_image = np.array((jnp.clip(debug_image, -1, 1) + 1) / 2 * 255, dtype=np.uint8)
                     # create_image_mosaic(debug_image, 4, BATCH_SIZE, f"!DEBUG{STEPS}.png")
@@ -605,30 +616,37 @@ def main():
                         preview = jax.jit(dec_state.call)(dec_state.params, preview)
                     preview = np.array((jnp.concatenate([preview[:preview.shape[0]//8], batch["og_images"][:BATCH_SIZE//8]][:preview.shape[0]//8], axis=0) + 1) / 2 * 255, dtype=np.uint8)
                     create_image_mosaic(preview, 4,  BATCH_SIZE//8//8, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
+                except Exception as e:
+                    print(e)
 
-                # save every n steps
-                if STEPS % SAVE_EVERY == 0:
+
+            if STEPS % SAVE_EVERY == 0:
+                try:
+
                     wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
-                    ckpt_manager.save(STEPS, {"dummy":"dummy"})
-                    try:
-                        save_file(flatten_dict(dit_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
-                        save_file(flatten_dict(dit_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
-                        save_file(flatten_dict(dit_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
-                    except Exception as e:
-                        print(e)
+                except Exception as e:
+                    print(e)
+                try:
+                    if not os.path.exists(f"{SAVE_MODEL_PATH}/{STEPS}"):
+                        os.makedirs(f"{SAVE_MODEL_PATH}/{STEPS}")
+                    save_file(flatten_dict(dit_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
+                    save_file(flatten_dict(dit_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
+                    save_file(flatten_dict(dit_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
+                except Exception as e:
+                    print(e)
 
-                progress_bar.update(1)
-                STEPS += 1
+            try:
+                # delete checkpoint 
+                if (STEPS - MAX_TO_SAVE * SAVE_EVERY) % PERMANENT_EPOCH_STORE == 0:
+                    pass
+                else:
+                    shutil.rmtree(f"{SAVE_MODEL_PATH}/{STEPS - MAX_TO_SAVE * SAVE_EVERY}")
+            except:
 
-    except KeyboardInterrupt:
-        STEPS += 1
-        print("Ctrl+C command detected. saving model before exiting...")
-        ckpt_manager.save(STEPS, {"dummy":"dummy"})
-        try:
-            save_file(flatten_dict(dit_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors")
-            save_file(flatten_dict(dit_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors")
-            save_file(flatten_dict(dit_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors")
-        except Exception as e:
-            print(e)
+                pass
+
+            progress_bar.update(1)
+            STEPS += 1
+
 
 main()

@@ -100,7 +100,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
 
         dit_backbone = DiTBLockContinuous(
             n_layers=28, 
-            embed_dim=1152, 
+            embed_dim=1152,
+            cond_embed_dim=1152,
             output_dim=latent_depth,
             n_heads=16, 
             use_flash_attention=False, 
@@ -111,7 +112,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             patch_size=patch_size,
             use_rope=True,
             n_time_embed_layers=3,
-            downsample_kv=False
+            downsample_kv=False,
+            denseformers=True,
         )
 
         # init model params

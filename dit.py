@@ -196,7 +196,7 @@ class SelfAttention(nn.Module):
         )
         # pointwise conv reformulated as matmul
         self.qkv = Dense(
-            features=self.embed_dim * self.expansion_factor * 3, 
+            features=int(self.embed_dim * self.expansion_factor * 3), 
             use_bias=self.use_bias
         )
         self.out = Dense(
@@ -269,6 +269,7 @@ class GLU(nn.Module):
     use_bias: bool = False
     eps:float = 1e-6
     cond: bool = True
+    checkpoint: bool = False
 
     def setup(self):
         self.rms_norm = nn.RMSNorm(
@@ -281,11 +282,15 @@ class GLU(nn.Module):
                 features=self.embed_dim * 2, 
                 use_bias=self.use_bias
             )
+        if self.checkpoint:
+            dense = nn.checkpoint(nn.Dense)
+        else:
+            dense = Dense
         # inverted bottleneck with gating
         # practically mimicing mobilenet except only pointwise conv
-        self.up_proj = Dense(self.embed_dim * self.expansion_factor, use_bias=False)
-        self.gate_proj = Dense(self.embed_dim * self.expansion_factor, use_bias=False)
-        self.down_proj = Dense(self.embed_dim, use_bias=False, kernel_init=jax.nn.initializers.zeros)
+        self.up_proj = dense(int(self.embed_dim * self.expansion_factor), use_bias=False)
+        self.gate_proj = dense(int(self.embed_dim * self.expansion_factor), use_bias=False)
+        self.down_proj = dense(self.embed_dim, use_bias=False, kernel_init=jax.nn.initializers.zeros)
 
     def __call__(self, x, cond=None):
         residual = x
@@ -485,6 +490,7 @@ class DiTBLockContinuous(nn.Module):
     n_heads: int = 8
     n_layers: int = 24
     n_time_embed_layers: int = 3
+    cond_embed_dim: int = 768
     time_embed_expansion_factor: int = 2
     diffusion_timesteps: int = 1000
     use_flash_attention: bool = False
@@ -495,6 +501,9 @@ class DiTBLockContinuous(nn.Module):
     use_rope: bool = True
     patch_size: int = 1
     downsample_kv: bool = False
+    split_time_embed: int = 1
+    denseformers: bool = False
+    checkpoint_glu: bool = False
 
     def setup(self):
         
@@ -510,7 +519,7 @@ class DiTBLockContinuous(nn.Module):
             raise Exception("not supported yet! still have to figure out padding shape")
 
         self.time_embed = FourierLayers(
-            features=self.embed_dim, 
+            features=self.cond_embed_dim, 
             keep_random=self.random_fourier_features,
         )
 
@@ -518,7 +527,7 @@ class DiTBLockContinuous(nn.Module):
         if self.n_class is not None:
             self.class_embed = nn.Embed(
                 self.n_class, 
-                features=self.embed_dim
+                features=self.cond_embed_dim
             )
 
         # transformers
@@ -533,13 +542,15 @@ class DiTBLockContinuous(nn.Module):
                 use_flash_attention=self.use_flash_attention,
                 downsample_kv=self.downsample_kv,
             )
-            glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps)
+            glu = GLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps, checkpoint=self.checkpoint_glu)
 
-            scaler_layers = [self.param(f'dense_skip_scaling_{layer}_{0}', nn.initializers.ones, ())]
-            for scaler_layer in range(layer+1):
-                other_layers_scaler = self.param(f'dense_skip_scaling_{layer}_{scaler_layer+1}', nn.initializers.zeros, ())
-                scaler_layers.append(other_layers_scaler)
-            
+            if self.denseformers:
+                scaler_layers = [self.param(f'dense_skip_scaling_{layer}_{0}', nn.initializers.ones, ())]
+                for scaler_layer in range(layer+1):
+                    other_layers_scaler = self.param(f'dense_skip_scaling_{layer}_{scaler_layer+1}', nn.initializers.zeros, ())
+                    scaler_layers.append(other_layers_scaler)
+            else:
+                scaler_layers = None
 
             dit_blocks.append([attn, glu, scaler_layers])
 
@@ -549,7 +560,7 @@ class DiTBLockContinuous(nn.Module):
         time_embedding_stack = [] 
         for layer in range(self.n_time_embed_layers):
             # overkill but eh whatever
-            glu_time = GLU(embed_dim=self.embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias, eps=self.eps, cond=False)
+            glu_time = GLU(embed_dim=self.cond_embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias, eps=self.eps, cond=False)
 
             time_embedding_stack.append(glu_time)
         self.time_embedding_stack = time_embedding_stack
@@ -652,19 +663,33 @@ class DiTBLockContinuous(nn.Module):
         for glu_time in self.time_embedding_stack:
 
             cond = glu_time(cond)
+        
+        if self.split_time_embed > 1:
+            cond_split = rearrange(x, "b l (d split) -> split b l d", split=self.split_time_embed)
+
         # jax.debug.print("max,{max} min,{min} mean,{mean}", max=cond.max(), min=cond.min(), mean=cond.mean())
 
         # attention block loop
         # skips
-        skips = [x]
-        for attn, glu, skip_scaler in self.dit_blocks:
+        # global dense connection for denseformers
+        # basically store every block intermediates and compute weighted average on it
+        if self.denseformers:
+            skips = [x]
+        for i, (attn, glu, skip_scaler) in enumerate(self.dit_blocks):
+
+            # split time embed dim to multiple blocks 
+            if self.split_time_embed > 1:
+                cond = cond_split[i % self.split_time_embed] 
+            
             x = attn(x, cond, jax.lax.stop_gradient(self.latent_positional_embedding) if self.use_rope else None, [n, h, w, c])
             x = glu(x, cond)
-            skips.append(x)
 
-            x *= skip_scaler[0]
-            for skip, scaler in zip(skips[:-1], skip_scaler[1:]):
-                x += skip * scaler
+            # global dense connection for denseformers
+            if self.denseformers:
+                skips.append(x)
+                x *= skip_scaler[0]
+                for skip, scaler in zip(skips[:-1], skip_scaler[1:]):
+                    x += skip * scaler
 
         # jax.debug.print("X max,{max} min,{min} mean,{mean}", max=x.max(), min=x.min(), mean=x.mean())
 
