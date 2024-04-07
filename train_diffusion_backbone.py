@@ -505,6 +505,7 @@ def main():
     IMAGE_PATH = "ramdisk/train_images"
     MAX_TO_SAVE = 3
     PERMANENT_EPOCH_STORE = 50000
+    LOAD_CHECKPOINTS = 151500
 
     if not os.path.exists(IMAGE_OUTPUT_PATH):
         os.makedirs(IMAGE_OUTPUT_PATH)
@@ -534,6 +535,20 @@ def main():
 
     # Open the text file in read mode
     STEPS = 0
+
+    if LOAD_CHECKPOINTS != 0:
+        print(f"RESUMING FROM CHECKPOINT:{LOAD_CHECKPOINTS}")
+        STEPS = LOAD_CHECKPOINTS
+        # load from safetensors
+        params = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors"))
+        mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors"))
+        nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors"))
+
+        dit_state.params.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), params))
+        dit_state.opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), mu))
+        dit_state.opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), nu))
+        del params, mu, nu # flush
+
     # dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
     dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
 

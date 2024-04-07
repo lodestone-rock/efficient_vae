@@ -100,8 +100,7 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
 
         dit_backbone = DiTBLockContinuous(
             n_layers=28, 
-            embed_dim=1152,
-            cond_embed_dim=1152,
+            embed_dim=1152, 
             output_dim=latent_depth,
             n_heads=16, 
             use_flash_attention=False, 
@@ -113,6 +112,8 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
             use_rope=True,
             n_time_embed_layers=3,
             downsample_kv=False,
+            split_time_embed=1,
+            checkpoint_glu=True,
             denseformers=True,
         )
 
@@ -503,7 +504,8 @@ def main():
     PATCH_SIZE = 1
     IMAGE_PATH = "ramdisk/train_images"
     MAX_TO_SAVE = 3
-    PERMANENT_EPOCH_STORE = 10000
+    PERMANENT_EPOCH_STORE = 50000
+    LOAD_CHECKPOINTS = 219500
 
     if not os.path.exists(IMAGE_OUTPUT_PATH):
         os.makedirs(IMAGE_OUTPUT_PATH)
@@ -538,6 +540,20 @@ def main():
 
     # Open the text file in read mode
     STEPS = 0
+
+    if LOAD_CHECKPOINTS != 0:
+        print(f"RESUMING FROM CHECKPOINT:{LOAD_CHECKPOINTS}")
+        STEPS = LOAD_CHECKPOINTS
+        # load from safetensors
+        params = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dit_params.safetensors"))
+        mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dit_mu.safetensors"))
+        nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dit_nu.safetensors"))
+
+        dit_state.params.update(jax_utils.replicate(params))
+        dit_state.opt_state[1][0].mu.update(jax_utils.replicate(mu))
+        dit_state.opt_state[1][0].nu.update(jax_utils.replicate(nu))
+        del params, mu, nu # flush
+
     # dataset = OxfordFlowersDataset(square_size=IMAGE_RES, seed=1)
     dataset = SquareImageNetDataset(IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
 
