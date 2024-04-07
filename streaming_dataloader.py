@@ -15,6 +15,8 @@ import pandas as pd
 # Set up logging
 # logging.basicConfig(filename='dataset_errors.log', level=logging.ERROR)
 
+from imagenet_classes import IMAGENET2012_CLASSES as imgnet_classes
+
 from concurrent.futures import ThreadPoolExecutor
 import random
 from queue import Queue
@@ -77,6 +79,10 @@ def threading_dataloader(dataset, batch_size=1, num_workers=10, collate_fn=None,
             time.sleep(10)
             print("dataloader queue:", prefetch_queue.qsize())
             print("worker queue:", workers._work_queue.qsize())
+            if workers._work_queue.qsize() + prefetch_queue.qsize() == 0:
+                print("all task is done, shutting down threads")
+                overseer.shutdown()
+                workers.shutdown()
 
     # just in case worker submit loop is too slow due to a ton of loops, fork it to another thread so the main thread can continue
     overseer.submit(overseer_thread)
@@ -158,7 +164,6 @@ class ImageFolderDataset():
         try:
             img_name = os.path.join(self.root_dir, self.file_list[idx])
             image = cv2.imread(img_name)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             if image.shape[-1] != 3:
                 raise "image has more than 3 channel"
             image = random_crop(image, self.square_size)
@@ -167,6 +172,117 @@ class ImageFolderDataset():
             return self.__getitem__(random.randrange(0, len(self.file_list)))
         
         return image
+
+
+class SquareImageNetDataset():
+    def __init__(self, root_dir, square_size=50, seed=84):
+        self.root_dir = root_dir
+        self.file_list = os.listdir(root_dir)
+        self.square_size = square_size
+        random.seed(seed)
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        sample = {}
+        try:
+            img_name = os.path.join(self.root_dir, self.file_list[idx])
+            image = cv2.imread(img_name)
+            if image.shape[-1] != 3:
+                raise "image has more than 3 channel"
+            # Calculate the dimensions for center crop
+            height, width = image.shape[:2]
+            crop_size = min(height, width)
+            top = (height - crop_size) // 2
+            left = (width - crop_size) // 2
+            bottom = top + crop_size
+            right = left + crop_size
+
+            # Perform center crop using NumPy array slicing
+            image = image[top:bottom, left:right]
+            image = cv2.resize(image, (self.square_size, self.square_size), interpolation=cv2.INTER_AREA)
+            # Generate a random number (0 or 1) to decide whether to flip the image
+            # flip_decision = random.randint(0, 1)
+            # if flip_decision == 1:
+            #     image = cv2.flip(image, 1)
+                
+            sample["image"] = image
+
+            sample["label"] = np.array(list(imgnet_classes.keys()).index(img_name.split("/")[-1].split("_")[0]))
+
+        except Exception as e:
+            return self.__getitem__(random.randrange(0, len(self.file_list)))
+        
+        return sample
+
+
+class OxfordFlowersDataset():
+    def __init__(self, square_size=50, seed=84):
+        from datasets import load_dataset
+        train_set = load_dataset("nelorth/oxford-flowers")
+        self.images = [np.array(image) for image in train_set["train"]["image"]]
+        self.labels = [np.array(label) for label in train_set["train"]["label"]]
+        self.square_size = square_size
+        random.seed(seed)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        sample = {}
+        try:
+            image = self.images[idx]
+            
+            if image.shape[-1] != 3:
+                raise "image has more than 3 channel"
+            # Calculate the dimensions for center crop
+            height, width = image.shape[:2]
+            crop_size = min(height, width)
+            top = (height - crop_size) // 2
+            left = (width - crop_size) // 2
+            bottom = top + crop_size
+            right = left + crop_size
+
+            # Perform center crop using NumPy array slicing
+            image = image[top:bottom, left:right]
+            image = cv2.resize(image, (self.square_size, self.square_size), interpolation=cv2.INTER_AREA)
+
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            sample["image"] = image
+
+            sample["label"] = self.labels[idx]
+
+        except Exception as e:
+            return self.__getitem__(random.randrange(0, len(self.file_list)))
+        
+        return sample
+
+
+def rando_colours(IMAGE_RES):
+    
+    max_colour = np.full([1, IMAGE_RES, IMAGE_RES, 1], 255)
+    min_colour = np.zeros((1, IMAGE_RES, IMAGE_RES, 1))
+
+    black = np.concatenate([min_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
+    white = np.concatenate([max_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    red = np.concatenate([max_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
+    green = np.concatenate([min_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
+    blue = np.concatenate([min_colour,min_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    magenta = np.concatenate([max_colour,min_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    cyan = np.concatenate([min_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
+    yellow = np.concatenate([max_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
+
+    r = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    g = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    b = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    rando_colour = np.concatenate([r,g,b],axis=-1) / 255 * 2 - 1 
+
+
+    absolute = [black, white] * 4
+    pallete = [red, green, blue, magenta, cyan, yellow, rando_colour] + absolute
+
+    return random.choice(pallete)
     
 
 # collate function here is to fill the gap due to lossy retrieval by simply filling the gap with random rotation of random sample
@@ -189,4 +305,26 @@ def collate_fn(batch):
     result = np.stack(truncated_batch, axis=0)
 
     return result
+
+# collate function here is to fill the gap due to lossy retrieval by simply filling the gap with random rotation of random sample
+# 
+def collate_labeled_imagenet_fn(batch):
+    # unpack the batch generated by dataloader and repack it as ndarray
+    images = [sample["image"] for sample in batch]
+    labels = [sample["label"] for sample in batch]
+
+
+    # combine
+    
+    return {
+        "images": np.stack(images, axis=0)  / 255 * 2 - 1,
+        "labels": np.stack(labels, axis=0),
+    }
+
+
+# dataset = OxfordFlowersDataset(square_size=256, seed=1)
+# t_dl = threading_dataloader(dataset, batch_size=128, shuffle=True, collate_fn=collate_labeled_imagenet_fn,  num_workers=100, prefetch_factor=0.5, seed=1)
+# x = SquareImageNetDataset("ramdisk/train_images",square_size=512)
+# x[0]
+# print()
 
