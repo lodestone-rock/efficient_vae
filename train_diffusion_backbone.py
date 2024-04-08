@@ -15,7 +15,6 @@ from einops import rearrange
 from flax.training import train_state
 import optax
 import flax.linen as nn
-import orbax.checkpoint
 from tqdm import tqdm
 import wandb
 import jmp
@@ -25,7 +24,7 @@ from typing import Callable
 import dm_pix as pix
 
 from vae import Decoder, Encoder
-from dit import DiTBLockContinuous, rand_stratified_cosine
+from dit import DiTBLockContinuous, rand_stratified_cosine, ConvBLockContinuous
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
 from streaming_dataloader import threading_dataloader, collate_labeled_imagenet_fn, SquareImageNetDataset, rando_colours, OxfordFlowersDataset
 
@@ -47,11 +46,6 @@ mixed_precision_policy = jmp.Policy(
     param_dtype=jnp.float32,
     output_dtype=jnp.float32
 )
-
-def checkpoint_manager(save_path, max_to_keep=2):
-    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=max_to_keep, create=True)
-    return orbax.checkpoint.CheckpointManager(os.path.abspath(save_path), orbax_checkpointer, options)
 
 
 def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 42, learning_rate = 10e-3, pretrained_vae_ckpt=None, vae_ckpt_steps=1, latent_depth=256, patch_size=1):
@@ -88,26 +82,46 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         )
 
         slice = 1
-        dit_backbone = DiTBLockContinuous(
+        # dit_backbone = DiTBLockContinuous(
+        #     n_layers=int(12 * slice), 
+        #     embed_dim=2048, 
+        #     cond_embed_dim=1024,
+        #     output_dim=latent_depth,
+        #     n_heads=int(32), 
+        #     use_flash_attention=False, 
+        #     latent_size=training_res // latent_ratio, 
+        #     n_class=1001, 
+        #     pixel_based=False,
+        #     attn_expansion_factor=1/slice,
+        #     glu_expansion_factor=2/slice,
+        #     time_embed_expansion_factor=1,
+        #     patch_size=patch_size,
+        #     use_rope=True,
+        #     n_time_embed_layers=3,
+        #     downsample_kv=False,
+        #     split_time_embed=1,
+        #     checkpoint_glu=True,
+        #     denseformers=True,
+        # )
+        dit_backbone = ConvBLockContinuous(
             n_layers=int(12 * slice), 
-            embed_dim=2048, 
-            cond_embed_dim=1024,
+            kernel_size=7,
+            embed_dim=2304, 
+            cond_embed_dim=1152,
             output_dim=latent_depth,
-            n_heads=int(32), 
-            use_flash_attention=False, 
+            n_heads=int(32),
             latent_size=training_res // latent_ratio, 
             n_class=1001, 
             pixel_based=False,
-            attn_expansion_factor=1/slice,
+            conv_expansion_factor=1/slice,
             glu_expansion_factor=2/slice,
             time_embed_expansion_factor=1,
             patch_size=patch_size,
-            use_rope=True,
             n_time_embed_layers=3,
-            downsample_kv=False,
             split_time_embed=1,
             checkpoint_glu=True,
-            denseformers=True,
+            checkpoint_conv=True,
+            densenet=False,
         )
 
         # init model params
@@ -124,24 +138,10 @@ def init_model(batch_size = 256, training_res = 256, latent_ratio = 32, seed = 4
         #  x, timestep, cond=None, image_pos=None, extra_pos=None
         dit_params = dit_backbone.init(dit_rng, dummy_latent, timesteps, conds, toggle_cond=conds)
         # load vae ckpt
-        vae_manager = checkpoint_manager(pretrained_vae_ckpt,2)
-        raw_restored = vae_manager.restore(directory=os.path.abspath(pretrained_vae_ckpt), step=vae_ckpt_steps)
-        if pretrained_vae_ckpt is not None:
-            if vae_ckpt_steps < 100:
-                print("ARE YOU FREAKING SURE THAT VAE IS TRAINED?")
-            # overwrite vae params with pretrained
-            enc_params_flatten = flatten_dict(enc_params)
-            dec_params_flatten = flatten_dict(dec_params)
-
-            orbax_enc_params_flatten = flatten_dict(raw_restored[0]["params"])
-            orbax_dec_params_flatten = flatten_dict(raw_restored[1]["params"])
-
-            enc_params = unflatten_dict({key: orbax_enc_params_flatten[key] for key in enc_params_flatten})
-            dec_params = unflatten_dict({key: orbax_dec_params_flatten[key] for key in dec_params_flatten})
-
-
-            enc_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices()[0]), enc_params)
-            dec_params = jax.tree_map(lambda x: jax.device_put(x, jax.devices()[0]), dec_params)
+        flatten_encoder_params = load_file(f"{pretrained_vae_ckpt}/encoder_5m_f16c64.safetensors")
+        flatten_decoder_params = load_file(f"{pretrained_vae_ckpt}/decoder_5m_f16c64.safetensors")
+        enc_params = unflatten_dict(flatten_encoder_params)
+        dec_params = unflatten_dict(flatten_decoder_params)
 
         enc_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, enc_params)).values()))
         dec_param_count = sum(list(flatten_dict(jax.tree_map(lambda x: x.size, dec_params)).values()))
@@ -488,7 +488,7 @@ def euler_solver(func, init_cond, t_span, dt, conds=None, model_params=None,  mo
 def main():
     BATCH_SIZE = 256 //2
     SEED = 0
-    SAVE_MODEL_PATH = "imagenet_DDiT_wide_base_dense"
+    SAVE_MODEL_PATH = "imagenet_conv_wide_base_dense"
     IMAGE_RES = 256
     LATENT_RATIO = 16
     SAVE_EVERY = 500
@@ -505,7 +505,7 @@ def main():
     IMAGE_PATH = "ramdisk/train_images"
     MAX_TO_SAVE = 3
     PERMANENT_EPOCH_STORE = 50000
-    LOAD_CHECKPOINTS = 151500
+    LOAD_CHECKPOINTS = 0
 
     if not os.path.exists(IMAGE_OUTPUT_PATH):
         os.makedirs(IMAGE_OUTPUT_PATH)
@@ -517,7 +517,6 @@ def main():
     # init seed
     train_rng = jax.random.PRNGKey(SEED)
     # init checkpoint manager
-    ckpt_manager = checkpoint_manager(SAVE_MODEL_PATH, max_to_keep=4)
     # init models
     models = init_model(
         batch_size=BATCH_SIZE, 

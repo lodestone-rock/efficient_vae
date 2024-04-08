@@ -305,6 +305,105 @@ class GLU(nn.Module):
             return x + residual
 
 
+class CGLU(nn.Module):
+    embed_dim: int = 768
+    expansion_factor: int = 4
+    use_bias: bool = False
+    eps:float = 1e-6
+    cond: bool = True
+    checkpoint: bool = False
+
+    def setup(self):
+        self.rms_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        if self.cond:
+            self.cond_projection =  Dense(
+                features=self.embed_dim * 2, 
+                use_bias=self.use_bias
+            )
+        if self.checkpoint:
+            dense = nn.checkpoint(nn.Dense)
+        else:
+            dense = Dense
+        # inverted bottleneck with gating
+        # practically mimicing mobilenet except only pointwise conv
+        self.up_proj = dense(int(self.embed_dim * self.expansion_factor), use_bias=False)
+        self.gate_proj = dense(int(self.embed_dim * self.expansion_factor), use_bias=False)
+        self.down_proj = dense(self.embed_dim, use_bias=False, kernel_init=jax.nn.initializers.zeros)
+
+    def __call__(self, x, cond=None):
+        residual = x
+        x = self.rms_norm(x)
+        if self.cond:
+            scale, shift = rearrange(self.cond_projection(cond), "n h w (c split) -> split n h w c", split=2)
+            x = embedding_modulation(x, scale, shift)
+        x = self.down_proj(self.up_proj(x) * nn.silu(self.gate_proj(x)))
+        if self.cond:
+            return x + residual
+        else:
+            return x + residual
+    
+
+class EfficientConv(nn.Module):
+    features: int
+    kernel_size: int
+    expansion_factor: int = 4 # inverted bottleneck scale factor to up project inner conv
+    group_count: int = 16
+    use_bias: bool = False # removing bias won't affect the model much
+    eps:float = 1e-6
+    checkpoint: bool = False
+
+    def setup(self):
+
+        if self.checkpoint:
+            conv = nn.checkpoint(nn.Conv)
+        else:
+            conv = nn.Conv
+
+        self.group_norm = nn.GroupNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+
+        self.cond_projection =  Dense(
+            features=int(self.features * 2), 
+            use_bias=self.use_bias
+        )
+
+        self.grouped_conv = conv(
+            features=int(self.features * self.expansion_factor),
+            kernel_size=(self.kernel_size, self.kernel_size), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=int(self.features * self.expansion_factor // self.group_count),
+            use_bias=self.use_bias,
+        )
+    
+        # activation
+        # pointwise conv reformulated as matmul
+        self.pointwise_contract = nn.Dense(
+            features=int(self.features), 
+            use_bias=self.use_bias,
+            kernel_init=jax.nn.initializers.zeros
+        )
+
+    def __call__(self, x, cond, og_image_shape=None):
+        # NOTE: flax uses NHWC convention so the entire ops is in NHWC
+        # store input as residual identity
+        residual = x
+        x = self.group_norm(x)
+        scale, shift = rearrange(self.cond_projection(cond), "n h w (c split) -> split n h w c", split=2)
+        x = embedding_modulation(x, scale, shift)
+        x = self.grouped_conv(x)
+        x = nn.silu(x)
+        x = self.pointwise_contract(x)
+        return  x + residual
+
+
 class FourierLayers(nn.Module):
     # linear layer probably sufficient but eh why not
     features: int = 768
@@ -473,6 +572,223 @@ class DiTBLock(nn.Module):
         x = self.output(x)
         x = rearrange(x, "n (h w) c -> n h w c", h=h)
         return x
+
+
+class ConvBLockContinuous(nn.Module):
+    # to use this model during inference please wrap model.apply with model.pred method
+    # model.pred(model.apply, x, timesteps, conds, *rest_of_args)
+    sigma_data: float = 0.5
+
+    embed_dim: int = 768
+    output_dim: int = 256
+    kernel_size: int = 3
+    conv_expansion_factor: int = 2
+    glu_expansion_factor: int = 4
+    use_bias: bool = False
+    eps:float = 1e-6
+    n_heads: int = 8
+    n_layers: int = 24
+    n_time_embed_layers: int = 3
+    cond_embed_dim: int = 768
+    time_embed_expansion_factor: int = 2
+    n_class: int = 1000
+    latent_size: int = 8
+    pixel_based: bool = False
+    random_fourier_features: bool = False
+    patch_size: int = 1
+    split_time_embed: int = 1
+    densenet: bool = False
+    checkpoint_glu: bool = False
+    checkpoint_conv: bool = False
+
+    def setup(self):
+        
+
+        self.linear_proj_input = Dense(
+            features=self.embed_dim, 
+            use_bias=self.use_bias
+        )
+
+        self.time_embed = FourierLayers(
+            features=self.cond_embed_dim, 
+            keep_random=self.random_fourier_features,
+        )
+
+        # class embed just an ordinary lookup table
+        if self.n_class is not None:
+            self.class_embed = nn.Embed(
+                self.n_class, 
+                features=self.cond_embed_dim
+            )
+
+        # transformers
+        dit_blocks = []
+        for layer in range(self.n_layers):
+
+            conv = EfficientConv(
+                features=self.embed_dim, 
+                kernel_size=self.kernel_size, 
+                expansion_factor=self.conv_expansion_factor, 
+                group_count=self.n_heads, 
+                use_bias=self.use_bias, 
+                eps=self.eps,
+                checkpoint=self.checkpoint_conv
+            ) 
+            # attn = SelfAttention(
+            #     n_heads=self.n_heads, 
+            #     expansion_factor=self.attn_expansion_factor, 
+            #     use_bias=self.use_bias, 
+            #     eps=self.eps,
+            #     embed_dim=self.embed_dim,
+            #     use_flash_attention=self.use_flash_attention,
+            #     downsample_kv=self.downsample_kv,
+            # )
+            glu = CGLU(embed_dim=self.embed_dim, expansion_factor=self.glu_expansion_factor, use_bias=self.use_bias, eps=self.eps, checkpoint=self.checkpoint_glu)
+
+            if self.densenet:
+                scaler_layers = [self.param(f'dense_skip_scaling_{layer}_{0}', nn.initializers.ones, ())]
+                for scaler_layer in range(layer+1):
+                    other_layers_scaler = self.param(f'dense_skip_scaling_{layer}_{scaler_layer+1}', nn.initializers.zeros, ())
+                    scaler_layers.append(other_layers_scaler)
+            else:
+                scaler_layers = None
+
+            dit_blocks.append([conv, glu, scaler_layers])
+
+        self.dit_blocks = dit_blocks
+
+
+
+        # time embedding
+        time_embedding_stack = [] 
+        for layer in range(self.n_time_embed_layers):
+            # overkill but eh whatever
+            glu_time = GLU(embed_dim=self.cond_embed_dim, expansion_factor=self.time_embed_expansion_factor, use_bias=self.use_bias, eps=self.eps, cond=False)
+
+            time_embedding_stack.append(glu_time)
+        self.time_embedding_stack = time_embedding_stack
+
+        self.final_norm = nn.GroupNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        if self.pixel_based:
+            self.output = Dense(
+                features=3 * self.patch_size * 2 if self.patch_size > 1 else 3, 
+                use_bias=self.use_bias
+            )
+        else:
+            self.output = Dense(
+                features=self.output_dim * self.patch_size * 2 if self.patch_size > 1 else self.output_dim, 
+                use_bias=self.use_bias
+            )
+
+
+
+    def sigma_scaling(self, timesteps):
+        # this is karras preconditioning formula to help the model stays in unit variance
+        # better alternatives than replacing the noise from standard gaussian to have unit variance 
+        c_skip = self.sigma_data ** 2 / (timesteps ** 2 + self.sigma_data ** 2)
+        c_out = timesteps * self.sigma_data / (timesteps ** 2 + self.sigma_data ** 2) ** 0.5
+        c_in = 1 / (timesteps ** 2 + self.sigma_data ** 2) ** 0.5
+        # reweight loss so it focus more on low frequency denoising part
+        soft_weighting = (timesteps * self.sigma_data) ** 2 / (timesteps ** 2 + self.sigma_data ** 2) ** 2
+        return c_skip, c_out, c_in, soft_weighting
+
+
+    def loss(self, rng_key, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None):
+        c_skip, c_out, c_in, soft_weighting = [scale[:, None, None, None] for scale in self.sigma_scaling(timesteps)]
+        noises = jax.random.normal(key=rng_key, shape=images.shape)
+        noised_images = (images + noises * timesteps[:, None, None, None])
+        model_predictions = model_apply_fn(model_params, noised_images * c_in, timesteps, conds, image_pos, extra_pos)
+        # target "noise"
+        # this scaling has interesting dynamics if you print out the image
+        # mainly the model returned a prediction based on frequency that remains after noise is added
+        target_predictions = (images - noised_images * c_skip)/c_out
+        loss = jnp.mean((model_predictions-target_predictions)** 2, axis=[1,2,3]) * soft_weighting.reshape(-1)
+        return jnp.mean(loss), (model_predictions, target_predictions, model_predictions - target_predictions, noised_images, images)  # flatten
+
+
+    def pred(self, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None):
+        c_skip, c_out, c_in, _ = [scale[:, None, None, None] for scale in self.sigma_scaling(timesteps)]
+        return model_apply_fn(model_params, images * c_in, timesteps, conds, image_pos, extra_pos) * c_out + images * c_skip
+
+
+    def rectified_flow_loss(self, rng_key, model_apply_fn, model_params, images, timesteps, conds, image_pos=None, extra_pos=None, toggle_cond=None):
+        noises = jax.random.normal(key=rng_key, shape=images.shape)
+        noise_to_image_flow = noises * timesteps[:, None, None, None] + images * (1-timesteps[:, None, None, None]) # vector field pointing towards images
+        flow_path = noises - images # noise >>>>towards>>>> image
+        model_trajectory_predictions = model_apply_fn(model_params, noise_to_image_flow, timesteps, conds, image_pos, extra_pos, toggle_cond)
+
+        loss = jnp.mean((model_trajectory_predictions - flow_path)** 2)
+        return loss, (model_trajectory_predictions, model_trajectory_predictions - flow_path, flow_path, images)  # flatten
+    
+    
+    def pred_rectified_flow(self, images, timesteps, conds, model_apply_fn, model_params, image_pos=None, extra_pos=None, toggle_cond=None):
+        return model_apply_fn(model_params, images, timesteps, conds, image_pos, extra_pos, toggle_cond)
+
+
+    def __call__(self, x, timestep, cond=None, image_pos=None, extra_pos=None, toggle_cond=None):
+        # NOTE: flax uses NHWC convention so the entire ops is in NHWC
+        # merge height and weight and treat it as a token sequence
+        # NHWC => BLD 
+        if self.patch_size > 1:
+            x = space_to_depth(x, self.patch_size, self.patch_size)
+        n, h, w, c = x.shape
+        x = self.linear_proj_input(x)
+
+        # time loop 
+        time = self.time_embed(timestep[:,None])[:,None,:] # grab the time
+        if self.n_class and cond is not None :
+            class_cond = self.class_embed(cond)[:,None,:]
+            if toggle_cond is not None:
+                cond = time + class_cond * toggle_cond[:, None, None]
+            else:
+                cond = time + class_cond
+        else:
+            cond = time 
+        # mebbe ditching this loop is simpler 
+        # simple time embedding vector should suffice
+        # silly ideas, rescale the input vector relative to this 
+        # so the model pay more attention to the timesteps or class
+        for glu_time in self.time_embedding_stack:
+            cond = glu_time(cond)
+        
+        if self.split_time_embed > 1:
+            cond_split = rearrange(x, "b l (d split) -> split b l d", split=self.split_time_embed)
+
+        # attention block loop
+        # skips
+        # global dense connection for denseformers
+        # basically store every block intermediates and compute weighted average on it
+        if self.densenet:
+            skips = [x]
+        for i, (conv, glu, skip_scaler) in enumerate(self.dit_blocks):
+
+            # split time embed dim to multiple blocks 
+            if self.split_time_embed > 1:
+                cond = cond_split[i % self.split_time_embed] 
+            
+            # condition reshaped so it has w and h dim
+            x = conv(x, cond[:,None, ...], [n, h, w, c])
+            x = glu(x, cond[:,None, ...])
+
+            # global dense connection for denseformers
+            if self.densenet:
+                skips.append(x)
+                x *= skip_scaler[0]
+                for skip, scaler in zip(skips[:-1], skip_scaler[1:]):
+                    x += skip * scaler
+
+        x = self.final_norm(x)
+        # x = embedding_modulation(x, scale, shift)
+        x = self.output(x)
+        # x = rearrange(x, "n (h w) c -> n h w c", h=h)
+        if self.patch_size > 1:
+            x = depth_to_space(x, self.patch_size, self.patch_size)
+        return x
+
 
 
 class DiTBLockContinuous(nn.Module):
