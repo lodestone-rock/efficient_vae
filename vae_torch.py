@@ -3,15 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-# pixel unshuffle
-def space_to_depth(x, h=2, w=2):
-    return rearrange(x, '... (h dh) (w dw) c -> ... h w (c dh dw)', dh=h, dw=w)
-
-
-# pixel shuffle
-def depth_to_space(x, h=2, w=2):
-    return rearrange(x, '... h w (c dh dw) -> ... (h dh) (w dw) c', dh=h, dw=w)
-
 
 class EfficientConv(nn.Module):
     def __init__(self, features, kernel_size, expansion_factor=4, group_count=16, use_bias=False, eps=1e-6, classic_conv=False, residual=True):
@@ -25,7 +16,7 @@ class EfficientConv(nn.Module):
         self.classic_conv = classic_conv
         self.residual = residual
 
-        self.group_norm = nn.GroupNorm(num_groups=1, num_channels=features, eps=eps)
+        self.group_norm = nn.GroupNorm(num_groups=32, num_channels=features, eps=eps)
 
         if classic_conv:
             self.conv = nn.Conv2d(features, features * expansion_factor, kernel_size=kernel_size, padding=kernel_size // 2, bias=use_bias)
@@ -47,7 +38,8 @@ class EfficientConv(nn.Module):
             x = F.silu(self.pointwise_expand(x))
             x = F.silu(self.depthwise(x))
 
-        x = self.pointwise_contract(x)
+        x = self.pointwise_contract(rearrange(x, "n c h w -> n h w c"))
+        x = rearrange(x, "n h w c-> n c h w")
 
         if self.residual:
             x = x + residual
@@ -56,11 +48,11 @@ class EfficientConv(nn.Module):
     
 
 class Upsample(nn.Module):
-    def __init__(self, features, use_bias=False):
+    def __init__(self, in_features, features, use_bias=False):
         super(Upsample, self).__init__()
         self.features = features
         self.use_bias = use_bias
-        self.conv = nn.Conv2d(features, features, kernel_size=3, padding=1, bias=use_bias)
+        self.conv = nn.Conv2d(in_features, features, kernel_size=3, padding=1, bias=use_bias)
 
     def forward(self, x):
         x = F.interpolate(x, scale_factor=2, mode='nearest')
@@ -69,11 +61,11 @@ class Upsample(nn.Module):
 
 
 class Downsample(nn.Module):
-    def __init__(self, features, use_bias=False):
+    def __init__(self, in_features, features, use_bias=False):
         super(Downsample, self).__init__()
         self.features = features
         self.use_bias = use_bias
-        self.conv = nn.Conv2d(features, features, kernel_size=3, stride=2, padding=0, bias=use_bias)
+        self.conv = nn.Conv2d(in_features, features, kernel_size=3, stride=2, padding=0, bias=use_bias)
 
     def forward(self, x):
         x = F.pad(x, (0, 1, 0, 1))
@@ -112,18 +104,19 @@ class Encoder(nn.Module):
             )
 
         # down
-        down_projections = []
-        down_blocks = []
+        # down_projections = []
+        self.blocks  = nn.ModuleList()
 
         for stage, layer_count in enumerate(self.down_layer_blocks):
             # projection layer (pointwise conv) 
             input_proj = Downsample(
+                in_features=self.down_layer_dim[stage] if stage == 0 else self.down_layer_dim[stage-1], 
                 features=self.down_layer_dim[stage],
                 use_bias=self.use_bias,
             )
-            down_projections.append(input_proj)
+            # down_projections.append(input_proj)
             
-            down_layers = []
+            down_layers = nn.ModuleList()
             for layer in range(layer_count):
                 down_layer = EfficientConv(
                     features=self.down_layer_dim[stage],
@@ -137,9 +130,9 @@ class Encoder(nn.Module):
                 )
 
                 down_layers.append(down_layer)
-            down_blocks.append(down_layers)
+            self.blocks.append(nn.ModuleList([input_proj, down_layers]))
 
-        self.blocks = list(zip(self.down_layer_contraction_factor, down_projections, down_blocks))
+        # self.blocks = nn.ModuleList(list(zip(down_projections, down_blocks)))
 
         # cant decide which is which so gonna put it in the config
         if self.last_layer == "conv":
@@ -157,7 +150,7 @@ class Encoder(nn.Module):
                 bias=True,
             )
         self.final_norm = nn.GroupNorm(
-            num_groups=1, 
+            num_groups=32, 
             num_channels=self.down_layer_dim[-1], 
             eps=self.eps,
         )
@@ -172,8 +165,7 @@ class Encoder(nn.Module):
 
     def forward(self, image):
         image = self.input_conv(image)
-        for patch, pointwise, conv_layers in self.blocks:
-            # image = space_to_depth(image, h=patch[0], w=patch[1]) 
+        for pointwise, conv_layers in self.blocks:
             image = pointwise(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
@@ -184,12 +176,13 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, output_features=3, up_layer_contraction_factor=((2, 2), (2, 2), (2, 2)), 
+    def __init__(self, intermediate_features=64, output_features=3, up_layer_contraction_factor=((2, 2), (2, 2), (2, 2)), 
                  up_layer_dim=(1024, 512, 256), up_layer_kernel_size=(7, 7, 7), 
                  up_layer_blocks=(2, 2, 2), up_layer_ordinary_conv=(False, False, False), 
                  up_layer_residual=(True, True, True), use_bias=False, conv_expansion_factor=(2, 2, 2), 
                  eps=1e-6, group_count=16):
         super(Decoder, self).__init__()
+        self.intermediate_features = intermediate_features
         self.output_features = output_features
         self.up_layer_contraction_factor = up_layer_contraction_factor
         self.up_layer_dim = up_layer_dim
@@ -213,11 +206,11 @@ class Decoder(nn.Module):
             )
 
         # up
-        up_blocks = []
-        up_projections = []
+        self.blocks = nn.ModuleList()
+        # up_projections = []
 
         for stage, layer_count in enumerate(self.up_layer_blocks):
-            up_layers = []
+            up_layers = nn.ModuleList()
             for layer in range(layer_count):
                 up_layer = EfficientConv(
                     features=self.up_layer_dim[stage],
@@ -231,24 +224,26 @@ class Decoder(nn.Module):
                 )
 
                 up_layers.append(up_layer)
-            up_blocks.append(up_layers)
 
             # TODO: add a way to disable this projection so the identity path is uninterrupted
             # projection layer (pointwise conv) 
             if stage + 1 == len(self.up_layer_blocks):
                 output_proj = Upsample(
+                    in_features=self.up_layer_dim[-1] if stage == 0 else self.up_layer_dim[-2], 
                     features=self.up_layer_dim[-1],
                     use_bias=self.use_bias,
                 )
             else:
                 output_proj = Upsample(
+                    in_features=self.up_layer_dim[stage],
                     features=self.up_layer_dim[stage + 1],
                     use_bias=self.use_bias,
                 )
-            up_projections.append(output_proj)
+            # up_projections.append(output_proj)
+            self.blocks.append(nn.ModuleList([output_proj, up_layers]))
             
 
-        self.blocks = list(zip(self.up_layer_contraction_factor, up_projections, up_blocks))
+        # self.blocks = nn.ModuleList(list(zip(up_projections, up_blocks)))
         self.final_norm = nn.GroupNorm(
             num_groups=1, 
             num_channels=self.up_layer_dim[-1], 
@@ -262,19 +257,20 @@ class Decoder(nn.Module):
             bias=True,
         )
         self.projections = nn.Linear(
-            self.up_layer_dim[0], 
+            self.intermediate_features, 
             self.up_layer_dim[0], 
             bias=True,
         )
 
     def forward(self, image):
-        image = self.projections(image)
-        for i, (patch, pointwise, conv_layers) in enumerate(self.blocks):
+        image = self.projections(rearrange(image, "n c h w -> n h w c"))
+        image = rearrange(image, "n h w c-> n c h w")
+
+        for i, (pointwise, conv_layers) in enumerate(self.blocks):
             for conv_layer in conv_layers:
                 image = conv_layer(image)
             
             image = pointwise(image)
-            # image = depth_to_space(image, h=patch[0], w=patch[1]) 
         image = self.final_norm(image)
         image = self.final_conv(image)
         image = torch.tanh(image)
