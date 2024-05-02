@@ -13,4 +13,7 @@ wandb
 datasets
 aqtp
 safetensors
+optree
+torch
+
 # manually install jax!
