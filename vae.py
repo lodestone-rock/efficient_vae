@@ -93,32 +93,55 @@ class EfficientConv(nn.Module):
         return x
 
 
-class SelfAttention(nn.Module):
-    # TODO: 
+class EfficientConvRMS(nn.Module):
     features: int
-    n_heads: int = 8
-    expansion_factor: int = 1
+    kernel_size: int
+    expansion_factor: int = 4 # inverted bottleneck scale factor to up project inner conv
+    group_count: int = 16
     use_bias: bool = False # removing bias won't affect the model much
     eps:float = 1e-6
+    classic_conv: bool = False # highly recommended toggling this on early layer
     residual: bool = True # toggle residual identity path (useful for first layer)
-
 
     def setup(self):
 
-        self.rms_norm = nn.RMSNorm(
+        self.group_norm = nn.RMSNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
-            param_dtype=jnp.float32
+            param_dtype=jnp.float32,
         )
-
+        # using classical conv on early layer will increase flops but make it faster to train 
+        if self.classic_conv:
+            self.conv = nn.Conv(
+                features=self.features * self.expansion_factor,
+                kernel_size=(self.kernel_size, self.kernel_size), 
+                strides=(1, 1),
+                padding="SAME",
+                feature_group_count=1,
+                use_bias=self.use_bias,
+            )
+            pass
+        else:
+            # pointwise conv reformulated as matmul
+            self.pointwise_expand = nn.Dense(
+                features=self.features * self.expansion_factor, 
+                use_bias=self.use_bias
+            )
+            self.depthwise = nn.Conv(
+                features=self.features * self.expansion_factor,
+                kernel_size=(self.kernel_size, self.kernel_size), 
+                strides=(1, 1),
+                padding="SAME",
+                feature_group_count=self.features * self.expansion_factor // self.group_count,
+                use_bias=self.use_bias,
+            )
+    
+        # activation
         # pointwise conv reformulated as matmul
-        self.qkv = nn.Dense(
-            features=self.features * self.expansion_factor * 3, 
-            use_bias=self.use_bias
-        )
-        self.qkv = nn.Dense(
+        self.pointwise_contract = nn.Dense(
             features=self.features, 
-            use_bias=self.use_bias
+            use_bias=self.use_bias,
+            kernel_init=jax.nn.initializers.zeros
         )
 
     def __call__(self, x,):
@@ -126,7 +149,18 @@ class SelfAttention(nn.Module):
         # store input as residual identity
         if self.residual:
             residual = x
-        x = self.rms_norm(x)
+        x = self.group_norm(x)
+        # use conv for early layer if possible
+        if self.classic_conv:
+            x = self.conv(x) 
+            x = nn.silu(x)
+        else:
+            x = self.pointwise_expand(x)
+            x = nn.silu(x)
+            x = self.depthwise(x)
+            x = nn.silu(x)
+            # projection back to input space
+        x = self.pointwise_contract(x)
 
         if self.residual:
             x = x + residual
@@ -176,6 +210,171 @@ class Downsample(nn.Module):
         x = jnp.pad(x, pad_width=pad)
         x = self.conv(x)
         return x
+
+
+class EncoderStageA(nn.Module):
+    first_layer_output_features: int = 24
+    output_features: int = 4
+    down_layer_dim: Tuple = (48, 96)
+    down_layer_kernel_size: Tuple = (3, 3)
+    down_layer_blocks: Tuple = (2, 2)
+    down_layer_ordinary_conv: Tuple = (False, False)
+    use_bias: bool = False 
+    conv_expansion_factor: Tuple = (2, 2)
+    eps:float = 1e-6
+    group_count: int = 16
+
+
+    def setup(self):
+
+        self.input_conv = nn.Conv(
+            features=self.first_layer_output_features,
+            kernel_size=(3, 3), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=1,
+            use_bias=True,
+        )
+
+        # down
+        down_projections = []
+        down_blocks = []
+
+        for stage, layer_count in enumerate(self.down_layer_blocks):
+            input_proj = Downsample(
+                features=self.down_layer_dim[stage],
+                use_bias=self.use_bias,
+            )
+            down_projections.append(input_proj)
+            
+            down_layers = []
+            for layer in range(layer_count):
+                down_layer = EfficientConvRMS(
+                    features=self.down_layer_dim[stage],
+                    kernel_size=self.down_layer_kernel_size[stage],
+                    expansion_factor=self.conv_expansion_factor[stage],
+                    group_count=self.group_count,
+                    use_bias=self.use_bias,
+                    eps=self.eps,
+                    classic_conv=self.down_layer_ordinary_conv[stage],
+                    residual=True,
+                )
+
+                down_layers.append(down_layer)
+            down_blocks.append(down_layers)
+
+        self.blocks = list(zip(down_projections, down_blocks))
+
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+        self.projections = nn.Dense(
+            features=self.output_features,
+            use_bias=True,
+        )
+
+    def __call__(self, image):
+        image = self.input_conv(image)
+        for downsample, conv_layers in self.blocks:
+            image = downsample(image)
+            for conv_layer in conv_layers:
+                image = conv_layer(image)
+        image = self.final_norm(image)
+        image = self.projections(image)
+        image = nn.tanh(image)
+        return image
+
+
+class DecoderStageA(nn.Module):
+    last_upsample_layer_output_features: int = 24
+    output_features: int = 3
+    up_layer_dim: Tuple = (96, 24)
+    up_layer_kernel_size: Tuple = (3, 3)
+    up_layer_blocks: Tuple = (2, 2)
+    up_layer_ordinary_conv: Tuple = (True, True) 
+    use_bias: bool = False 
+    conv_expansion_factor: Tuple = (2, 2)
+    eps:float = 1e-6
+    group_count: int = 16
+
+    def setup(self):
+        
+        self.projections = nn.Dense(
+            features=self.up_layer_dim[0],
+            use_bias=True,
+        )
+
+        # up
+        up_blocks = []
+        up_projections = []
+
+        for stage, layer_count in enumerate(self.up_layer_blocks):
+            up_layers = []
+            for layer in range(layer_count):
+                up_layer = EfficientConvRMS(
+                    features=self.up_layer_dim[stage],
+                    kernel_size=self.up_layer_kernel_size[stage],
+                    expansion_factor=self.conv_expansion_factor[stage],
+                    group_count=self.group_count,
+                    use_bias=self.use_bias,
+                    eps=self.eps,
+                    classic_conv=self.up_layer_ordinary_conv[stage],
+                    residual=True,
+                )
+
+                up_layers.append(up_layer)
+            up_blocks.append(up_layers)
+
+            # TODO: add a way to disable this projection so the identity path is uninterrupted
+            # projection layer (pointwise conv) 
+            if stage + 1 == len(self.up_layer_blocks):
+                output_proj = Upsample(
+                    features=self.up_layer_dim[-1],
+                    use_bias=self.use_bias,
+                )
+
+            else:
+
+                output_proj = Upsample(
+                    features=self.up_layer_dim[stage + 1],
+                    use_bias=self.use_bias,
+                )
+            up_projections.append(output_proj)
+            
+
+        self.blocks = list(zip(up_projections, up_blocks))
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+
+        self.final_conv = nn.Conv(
+            features=self.output_features,
+            kernel_size=(3, 3), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=1,
+            use_bias=True,
+        )
+
+
+
+    def __call__(self, image):
+
+        image = self.projections(image)
+        for  upsample, conv_layers in self.blocks:
+            for conv_layer in conv_layers:
+                image = conv_layer(image)
+            
+            image = upsample(image)
+        image = self.final_norm(image)
+        image = self.final_conv(image) 
+        image = nn.tanh(image)
+
+        return image
 
 
 class Encoder(nn.Module):
