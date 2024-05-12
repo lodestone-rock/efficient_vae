@@ -5,6 +5,16 @@ from einops import rearrange
 from typing import Tuple, Tuple
 
 
+def rectified_flow_loss(rng_key, model, model_params, images, conditions, timesteps):
+    noises = jax.random.normal(key=rng_key, shape=images.shape)
+    noise_to_image_flow = noises * timesteps[:, None, None, None] + images * (1-timesteps[:, None, None, None]) # lerp
+    flow_path = noises - images # noise >>>>towards>>>> image
+    model_trajectory_predictions = model(model_params, noise_to_image_flow, conditions, timesteps)
+
+    loss = jnp.mean((model_trajectory_predictions - flow_path)** 2)
+    return loss
+
+
 class EfficientConvRMS(nn.Module):
     features: int
     kernel_size: int
@@ -76,6 +86,110 @@ class EfficientConvRMS(nn.Module):
             x = x + residual
         return x
 
+
+class SelfAttention(nn.Module):
+    n_heads: int = 8
+    expansion_factor: int = 1
+    use_bias: bool = False # removing bias won't affect the model much
+    eps:float = 1e-6
+    embed_dim: int = 768
+    use_flash_attention: bool = False
+    downsample_kv: bool = False
+
+    def setup(self):
+
+        self.rms_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        # pointwise conv reformulated as matmul
+        self.qkv = nn.Dense(
+            features=int(self.embed_dim * self.expansion_factor * 3), 
+            use_bias=self.use_bias
+        )
+        self.out = nn.Dense(
+            features=self.embed_dim, 
+            use_bias=self.use_bias,
+            kernel_init=jax.nn.initializers.zeros
+        )
+
+    def __call__(self, x):
+        residual = x
+        x = self.rms_norm(x)
+        # query, key, value
+        q, k, v = rearrange(self.qkv(x), "b l (d split) -> split b l d", split=3)
+
+        # [batch_size, num_heads, q_seq_len, d_model]
+        q = rearrange(q, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+        # [batch_size, num_heads, kv_seq_len, d_model]
+        k = rearrange(k, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+        # [batch_size, num_heads, kv_seq_len, d_model]
+        v = rearrange(v, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+
+        out = nn.dot_product_attention(q,k,v)
+        # output projection
+        out = rearrange(out, "b l n_head d -> b l (n_head d)")
+        x = self.out(out)
+        return  x + residual
+
+
+class CrossAttention(nn.Module):
+    n_heads: int = 8
+    use_bias: bool = False
+    features: int = 768
+    eps:float = 1e-6
+
+    def setup(self):
+
+        self.rms_norm_q = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        self.rms_norm_cond = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32
+        )
+        self.q = nn.Dense(
+            features=int(self.features), 
+            use_bias=self.use_bias
+        )
+        self.kv = nn.Dense(
+            features=int(self.features * 2), 
+            use_bias=self.use_bias
+        )
+        self.out = nn.Dense(
+            features=self.features, 
+            use_bias=self.use_bias,
+            kernel_init=jax.nn.initializers.zeros
+        )
+
+    def __call__(self, x, cond):
+        n, h, w, c = x.shape
+        residual = x
+        x = rearrange(x, "n h w c -> n (h w) c") # to B L D
+        x = self.rms_norm_q(x)
+        cond = self.rms_norm_cond(cond)
+        q = self.q(x)
+        # query, key, value
+        k, v = rearrange(self.kv(cond), "b l (d split) -> split b l d", split=2)
+
+        # [batch_size, num_heads, q_seq_len, d_model]
+        q = rearrange(q, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+        # [batch_size, num_heads, kv_seq_len, d_model]
+        k = rearrange(k, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+        # [batch_size, num_heads, kv_seq_len, d_model]
+        v = rearrange(v, "b l (d n_head) -> b l n_head d", n_head=self.n_heads)
+
+        out = nn.dot_product_attention(q,k,v)
+        # output projection
+        out = rearrange(out, "b l n_head d -> b l (n_head d)")
+        x = self.out(out)
+        x = rearrange(x, "n (h w) c -> n h w c", h=h, w=w)
+        return  x + residual
+    
 
 class FourierLayers(nn.Module):
     # linear layer probably sufficient but eh why not
@@ -365,6 +479,11 @@ class UNetEncoderStageB(nn.Module):
 
     def setup(self):
 
+        self.projections = nn.Dense(
+            features=self.down_layer_dim[0],
+            use_bias=True,
+        )
+
         # down
         down_projections = []
         down_blocks = []
@@ -372,7 +491,7 @@ class UNetEncoderStageB(nn.Module):
         for stage, layer_count in enumerate(self.down_layer_blocks):
             if stage + 1 != len(self.down_layer_blocks):
                 input_proj = Downsample(
-                    features=self.down_layer_dim[stage],
+                    features=self.down_layer_dim[stage + 1],
                     use_bias=self.use_bias,
                 )
             else:
@@ -400,23 +519,21 @@ class UNetEncoderStageB(nn.Module):
 
         self.blocks = list(zip(down_projections, down_blocks))
 
-    def __call__(self, image, control, timestep):
-
-        # insert upscaled image as a seed image
-        image = image + jax.image.resize(control, image.shape)
+    def __call__(self, image, timestep):
+        image = self.projections(image)
         skips_for_decoder = []
-        for downsample, conv_layers in self.blocks:
+        for i, (downsample, conv_layers) in enumerate(self.blocks):
             # skip connection for the decoder
-            for i, (conv_layer, modulator) in enumerate(conv_layers):
+            for conv_layer, modulator in conv_layers:
                 # timestep information is inserted here
                 image = modulator(image, timestep)
                 image = conv_layer(image)
-            # ensure each skip connection also has the same original information
-            image = image + jax.image.resize(control, image.shape)
             skips_for_decoder.insert(0, image)
 
             # no downsample last layer
-            if i + 1 != len(self.down_layer_blocks):
+            if i + 1 == len(self.down_layer_blocks):
+                pass
+            else:
                 image = downsample(image)
         return skips_for_decoder
 
@@ -488,7 +605,7 @@ class UNetDecoderStageB(nn.Module):
 
     def __call__(self, skips, timestep):
 
-        for  i, upsample, conv_layers in enumerate(self.blocks, 0):
+        for  i, (upsample, conv_layers) in enumerate(self.blocks):
             # skip connections from encoder with injected image information
             if i > 0:
                 image = image + skips[i]
@@ -499,13 +616,15 @@ class UNetDecoderStageB(nn.Module):
                 image = modulator(image, timestep)
                 image = conv_layer(image)
             # no upsample last layer
-            if i + 1 != len(self.up_layer_blocks):
+            if i + 1 == len(self.up_layer_blocks):
+                pass
+            else:
                 image = upsample(image)
 
         # decoder for final layer
         image = self.final_norm(image)
         image = self.final_conv(image) 
-        image = nn.tanh(image)
+        # image = nn.tanh(image)
 
         return image
 
@@ -515,29 +634,35 @@ class UNetStageB(nn.Module):
     down_layer_dim: Tuple = (48, 96)
     down_layer_kernel_size: Tuple = (3, 3)
     down_layer_blocks: Tuple = (2, 2)
-    use_bias: bool = False 
-    conv_expansion_factor: Tuple = (2, 2)
+    down_group_count: int = (-1, -1)
+    down_conv_expansion_factor: Tuple = (2, 2)
 
-    output_features: int = 3
     up_layer_dim: Tuple = (96, 24)
     up_layer_kernel_size: Tuple = (3, 3)
     up_layer_blocks: Tuple = (2, 2)
-    use_bias: bool = False 
-    conv_expansion_factor: Tuple = (2, 2)
+    up_group_count: int = (-1, -1)
+    up_conv_expansion_factor: Tuple = (2, 2)
 
+    output_features: int = 3
+    use_bias: bool = False 
+    timestep_dim: int = 320
     eps:float = 1e-6
-    group_count: int = (-1, -1)
 
     def setup(self):
+        self.time_embed = FourierLayers(
+            features=self.timestep_dim, 
+            keep_random=False,
+        )
+
 
         self.encoder = UNetEncoderStageB(
             down_layer_dim=self.down_layer_dim,
             down_layer_kernel_size=self.down_layer_kernel_size,
             down_layer_blocks=self.down_layer_blocks,
             use_bias=self.use_bias, 
-            conv_expansion_factor=self.conv_expansion_factor,
+            conv_expansion_factor=self.down_conv_expansion_factor,
             eps=self.eps,
-            group_count=self.group_count,
+            group_count=self.down_group_count,
         )
 
         self.decoder = UNetDecoderStageB(
@@ -546,22 +671,114 @@ class UNetStageB(nn.Module):
             up_layer_kernel_size=self.up_layer_kernel_size,
             up_layer_blocks=self.up_layer_blocks,
             use_bias=self.use_bias, 
-            conv_expansion_factor=self.conv_expansion_factor,
+            conv_expansion_factor=self.up_conv_expansion_factor,
             eps=self.eps,
-            group_count=self.group_count,
+            group_count=self.up_group_count,
         )
 
-    def rectified_flow_loss(self, rng_key, model, model_params, images, conditions, timesteps):
-        noises = jax.random.normal(key=rng_key, shape=images.shape)
-        noise_to_image_flow = noises * timesteps[:, None, None, None] + images * (1-timesteps[:, None, None, None]) # lerp
-        flow_path = noises - images # noise >>>>towards>>>> image
-        model_trajectory_predictions = model(model_params, noise_to_image_flow, conditions, timesteps)
-
-        loss = jnp.mean((model_trajectory_predictions - flow_path)** 2)
-        return loss
-
-    def __init__(self, image, control, timestep):
-
-        skips = self.encoder(image, control, timestep)
+    def __call__(self, image, timestep):
+        timestep = self.time_embed(timestep)
+        skips = self.encoder(image, timestep)
         image = self.decoder(skips, timestep)
         return image
+
+
+class EfficientCrossAttnStageC(nn.Module):
+    first_layer_output_features: int = 24
+    output_features: int = 4
+    layer_dim: int = 320
+    timestep_dim: int = 320
+    cross_attn_heads: Tuple = (8, 8)
+    layer_kernel_size: Tuple = (3, 3)
+    layer_blocks: Tuple = (2, 2) # only 1 cross attn for each block
+    use_bias: bool = False 
+    conv_expansion_factor: Tuple = (2, 2)
+    eps:float = 1e-6
+    group_count: int = (-1, -1)
+
+
+    def setup(self):
+        self.time_embed = FourierLayers(
+            features=self.timestep_dim, 
+            keep_random=False,
+        )
+
+        self.input_conv = nn.Conv(
+            features=self.first_layer_output_features,
+            kernel_size=(3, 3), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=1,
+            use_bias=True,
+        )
+
+        # down
+        cross_modulators = []
+        blocks = []
+
+        for stage, layer_count in enumerate(self.layer_blocks):
+            cross_modulator = CrossAttention(
+                n_heads=self.cross_attn_heads[stage],
+                features=self.layer_dim,
+                use_bias=self.use_bias,
+                eps=self.eps,
+            )
+            cross_modulators.append(cross_modulator)
+            
+            layers = []
+            for layer in range(layer_count):
+
+                layer = EfficientConvRMS(
+                    features=self.layer_dim,
+                    kernel_size=self.layer_kernel_size[stage],
+                    expansion_factor=self.conv_expansion_factor[stage],
+                    group_count=self.group_count[stage],
+                    use_bias=self.use_bias,
+                    eps=self.eps,
+                    residual=True,
+                )
+                modulator = Modulator(
+                    features=self.layer_dim,
+                    use_bias=self.use_bias,
+                )
+
+                layers.append([layer, modulator])
+            blocks.append(layers)
+
+        self.blocks = list(zip(cross_modulators, blocks))
+
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+
+        self.final_conv = nn.Conv(
+            features=self.output_features,
+            kernel_size=(3, 3), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=1,
+            use_bias=True,
+        )
+
+
+    def __call__(self, image, cond, timestep):
+        timestep = self.time_embed(timestep)
+        image = self.input_conv(image)
+
+        for cross_modulators, conv_layers in self.blocks:
+            image = cross_modulators(image, cond)
+            for conv_layer, modulator in conv_layers:
+                image = modulator(image, timestep)
+                image = conv_layer(image)
+
+        image = self.final_norm(image)
+        image = self.final_conv(image)
+
+        image = nn.tanh(image)
+        return image
+
+
+class GuidanceProjectorStageD(nn.Module):
+    pass

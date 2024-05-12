@@ -42,7 +42,7 @@ mixed_precision_policy = jmp.Policy(
 
 def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_ratio=4, stage_a_path=None, seed = 42, learning_rate = 10e-3):
     with jax.default_device(jax.devices("cpu")[0]):
-        unet_rng = jax.random.split(jax.random.PRNGKey(seed), 1)
+        unet_rng, _ = jax.random.split(jax.random.PRNGKey(seed), 2)
 
         enc = EncoderStageA(
             first_layer_output_features = 24,
@@ -50,41 +50,38 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
             down_layer_dim = (48, 96),
             down_layer_kernel_size = (3, 3),
             down_layer_blocks = (8, 8),
-            down_layer_ordinary_conv = (True, True),
             use_bias = False ,
             conv_expansion_factor = (4, 4),
             eps = 1e-6,
-            group_count = 16,
-
-
+            group_count = (-1, -1)
         )
+
         dec = DecoderStageA(
             last_upsample_layer_output_features = 24,
             output_features = 3,
             up_layer_dim = (96, 48),
             up_layer_kernel_size = (3, 3),
             up_layer_blocks = (8, 8),
-            up_layer_ordinary_conv = (True, True) ,
             use_bias = False ,
             conv_expansion_factor = (4, 4),
             eps = 1e-6,
-            group_count = 16,
+            group_count = (-1, -1)
         )
 
         unet = UNetStageB(
-            down_layer_dim = (48, 96),
-            down_layer_kernel_size = (3, 3),
-            down_layer_blocks = (2, 2),
-            down_group_count = (-1, -1),
-            down_conv_expansion_factor = (2, 2),
+            down_layer_dim = (128, 256, 512, 768),
+            down_layer_kernel_size = (3, 3, 3, 3),
+            down_layer_blocks = (8, 8, 8, 4),
+            down_group_count = (-1, -1, -1, -1),
+            down_conv_expansion_factor = (2, 2, 2, 2),
 
-            up_layer_dim = (96, 24),
-            up_layer_kernel_size = (3, 3),
-            up_layer_blocks = (2, 2),
-            up_group_count = (-1, -1),
-            up_conv_expansion_factor = (2, 2),
+            up_layer_dim = (768, 512, 256, 128),
+            up_layer_kernel_size = (3, 3, 3, 3),
+            up_layer_blocks = (4, 8, 8, 8),
+            up_group_count = (-1, -1, -1, -1),
+            up_conv_expansion_factor = (2, 2, 2, 2),
 
-            output_features = 3,
+            output_features = latent_dim,
             use_bias = False,
             timestep_dim = 320,
             eps = 1e-6,
@@ -92,14 +89,14 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
 
 
         # init model params
-        image = jnp.ones((1, training_res, training_res, 3))
+        image = jnp.ones((batch_size, training_res, training_res, 3))
         # encoder
         enc_params = enc.init(jax.random.PRNGKey(0), image)
         # decoder
-        dummy_latent = jnp.ones((1, training_res // compression_ratio, training_res // compression_ratio, latent_dim))
+        dummy_latent = jnp.ones((batch_size, training_res // compression_ratio, training_res // compression_ratio, latent_dim))
         dec_params = dec.init(jax.random.PRNGKey(0), dummy_latent)
         # unet
-        timesteps = jnp.ones([batch_size]).astype(jnp.int32)
+        timesteps = jnp.ones([batch_size])[:,None].astype(jnp.int32)
         #  x, timestep, cond=None, image_pos=None, extra_pos=None
         unet_params = unet.init(unet_rng, dummy_latent, timesteps)
 
@@ -134,9 +131,9 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
         # do not apply weight decay to norm layer
         unet_state = train_state.TrainState.create(
             apply_fn=unet.apply,
-            params=unet.params,
+            params=unet_params,
             tx=adam_wrapper(
-                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", enc_params)
+                jax.tree_util.tree_map_with_path(lambda path, var: path[-1].key != "scale" and path[-1].key != "bias", unet_params)
             ),
         )
 
@@ -168,7 +165,7 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
 
         return [unet_state, enc_state, dec_state]
 
-# @jax.jit
+
 def train_flow_based(unet_state, enc_state, upscale_factor, batch, train_rng):
 
     # always create new RNG!
@@ -180,7 +177,7 @@ def train_flow_based(unet_state, enc_state, upscale_factor, batch, train_rng):
 
     # upscaled latents is used here as a guidance vector
     small_latents = enc_state.call(enc_state.params, jax.image.resize(batch, shape=(n, h//upscale_factor, w//upscale_factor, c), method="bicubic"))
-    small_latents = jax.image.resize(small_latents, shape=(n, h, w, c), method="bicubic")
+    small_latents = jax.image.resize(small_latents, shape=normal_latents.shape, method="bicubic")
 
     def _compute_loss(
         unet_params,  latents, upscaled_latents, rng_key
@@ -192,13 +189,13 @@ def train_flow_based(unet_state, enc_state, upscale_factor, batch, train_rng):
         # I think I should combine this with the first noise seed generator
         noise_rng, timestep_rng, cond_rng = jax.random.split(key=rng_key, num=3)
         # might need to play with this noise distribution weighting instead of uniform sampling
-        timesteps = jax.numpy.sort(jax.random.uniform(timestep_rng, [n])) 
+        timesteps = jax.numpy.sort(jax.random.uniform(timestep_rng, [n]))[:,None]
         # rectified flow loss wrt guided image
         toggle_cond = jax.random.choice(cond_rng, jnp.array([0, 1]), [n], p=jnp.array([0.1, 0.9]))
         # generate noise to be denoised with some garbage interpolated latent of original images
         noises = jax.random.normal(key=noise_rng, shape=latents.shape) + upscaled_latents * toggle_cond[:, None, None, None] 
         # compute interpolation
-        noise_image_lerp = noises * timesteps[:, None, None, None] + latents * (1-timesteps[:, None, None, None])
+        noise_image_lerp = noises * timesteps[:, None, None] + latents * (1-timesteps[:, None, None])
         flow_path = noises - latents # midpoint velocity
         model_pred = unet_state.apply_fn(unet_params, noise_image_lerp, timesteps)
         loss = jnp.mean((model_pred - flow_path)** 2)
@@ -227,7 +224,7 @@ def train_flow_based(unet_state, enc_state, upscale_factor, batch, train_rng):
     )
 
 
-def euler_solver(init_cond, t_span, dt, model_params=None,  model_apply_fn=None):
+def euler_solver(init_cond, t_span, dt, model_state=None):
     """
     Euler method solver for ODE: dZ/dt = v(Z, t)
 
@@ -247,21 +244,21 @@ def euler_solver(init_cond, t_span, dt, model_params=None,  model_apply_fn=None)
     Z = init_cond
 
     # simple wrapper to make less cluttered on ODE loop
-    def _func_wrap(init_cond, t, model_params):
-        return model_apply_fn(model_params, init_cond, t)
+    def _func_wrap(init_cond, t, model_state):
+        return jax.jit(model_state.apply_fn)(model_state.params, init_cond, t)
 
 
     # Euler method iteration
     for i in range(1, num_steps):
-        Z = Z - _func_wrap(Z, t[i - 1][None], model_params=model_params) * dt
+        Z = Z - _func_wrap(Z, jnp.stack([t[i - 1][None]]*Z.shape[0]) , model_state=model_state) * dt
 
     return Z
 
 
 def rando_colours(image_res):
     
-    max_colour = np.full([1, IMAGE_RES, IMAGE_RES, 1], 255)
-    min_colour = np.zeros((1, IMAGE_RES, IMAGE_RES, 1))
+    max_colour = np.full([1, image_res, image_res, 1], 255)
+    min_colour = np.zeros((1, image_res, image_res, 1))
 
     black = np.concatenate([min_colour,min_colour,min_colour],axis=-1) / 255 * 2 - 1 
     white = np.concatenate([max_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
@@ -272,9 +269,9 @@ def rando_colours(image_res):
     cyan = np.concatenate([min_colour,max_colour,max_colour],axis=-1) / 255 * 2 - 1 
     yellow = np.concatenate([max_colour,max_colour,min_colour],axis=-1) / 255 * 2 - 1 
 
-    r = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
-    g = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
-    b = np.random.randint(0, 255) * np.ones((1, IMAGE_RES, IMAGE_RES, 1))
+    r = np.random.randint(0, 255) * np.ones((1, image_res, image_res, 1))
+    g = np.random.randint(0, 255) * np.ones((1, image_res, image_res, 1))
+    b = np.random.randint(0, 255) * np.ones((1, image_res, image_res, 1))
     rando_colour = np.concatenate([r,g,b],axis=-1) / 255 * 2 - 1 
 
 
@@ -289,16 +286,18 @@ def inference(unet_state, enc_state, dec_state, batch, upscale_factor, seed, t_s
     n, h, w, c = batch.shape
     # initial noise + low res latent
     small_latents = jax.jit(enc_state.call)(enc_state.params, jax.image.resize(batch, shape=(n, h//upscale_factor, w//upscale_factor, c), method="bicubic"))
-    small_latents = jax.image.resize(small_latents, shape=(n, h, w, c), method="bicubic")
+    nl, hl, wl, cl = small_latents.shape
+
+    small_latents = jax.image.resize(small_latents, shape=(nl, hl*upscale_factor, wl*upscale_factor, cl), method="bicubic")
     init_cond = jax.random.normal(key=jax.random.PRNGKey(seed), shape=small_latents.shape) + small_latents
 
     # solve the model
-    latents = euler_solver(init_cond, t_span, dt, model_params=unet_state,  model_apply_fn=unet_state.apply_fn)
+    latents = euler_solver(init_cond, t_span, dt, model_state=unet_state)
 
     # convert back to pixel space
-    logits = dec_state.call(dec_state.params, latents)
-    images = (logits + 1) / 2 * 255
-    return images
+    logits = jax.jit(dec_state.call)(dec_state.params, latents)
+    
+    return logits
 
 
 def main():
@@ -306,19 +305,22 @@ def main():
     SEED = 0
     EPOCHS = 100
     SAVE_MODEL_PATH = "vae_small_ckpt"
-    STAGE_A_PATH = "stage_a_safetensors"
+    STAGE_A_PATH = "stage_a_safetensors/119092"
     TRAINING_IMAGE_PATH = "ramdisk/train_images"
+    IMAGE_OUTPUT_PATH = "output_stage_b"
     IMAGE_RES = 256
     LATENT_DIM = 4
     COMPRESSION_RATIO = 4
     UPSCALE_FACTOR = 4
     SAVE_EVERY = 50000
     LEARNING_RATE = 1e-4
-    WANDB_PROJECT_NAME = "vae"
-    WANDB_RUN_NAME = "PINVAE"
+    WANDB_PROJECT_NAME = "cascade-b"
+    WANDB_RUN_NAME = "stage-b"
     WANDB_LOG_INTERVAL = 100
     LOAD_CHECKPOINTS = 0
 
+    if not os.path.exists(IMAGE_OUTPUT_PATH):
+        os.makedirs(IMAGE_OUTPUT_PATH)
     # wandb logging
     if WANDB_PROJECT_NAME:
         wandb.init(project=WANDB_PROJECT_NAME, name=WANDB_RUN_NAME)
@@ -355,6 +357,7 @@ def main():
 
     STEPS = 0
 
+    train_flow_based_jit = jax.jit(train_flow_based, static_argnames=["upscale_factor"])
     for _ in range(EPOCHS):
         # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
         dataset = ImageFolderDataset(TRAINING_IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
@@ -381,7 +384,7 @@ def main():
             )
 
             # train
-            unet_state, metrics, train_rng = train_flow_based(unet_state, enc_state, UPSCALE_FACTOR, batch, train_rng)
+            unet_state, metrics, train_rng = train_flow_based_jit(unet_state, enc_state, UPSCALE_FACTOR, batch, train_rng)
 
 
             if STEPS % (WANDB_LOG_INTERVAL//10) == 0:
@@ -400,15 +403,15 @@ def main():
                 model_eval = inference(unet_state, enc_state, dec_state, eval_sample, UPSCALE_FACTOR, 0, (1, 0.001), 0.01)
 
                 preview = jnp.concatenate([eval_sample, model_eval], axis=0)
+                preview = (preview + 1) / 2 * 255
                 preview  = np.array(preview, dtype=np.uint8)
-
-                create_image_mosaic(preview, 4, 4, f"output_stage_b/{STEPS}.png")
+                create_image_mosaic(preview, 4, 4, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
 
             # save every n steps
             if STEPS % SAVE_EVERY == 0:
                 try:
 
-                    wandb.log({"image": wandb.Image(f'output/{STEPS}.png')}, step=STEPS)
+                    wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
                 except Exception as e:
                     print(e)
 
