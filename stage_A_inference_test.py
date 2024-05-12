@@ -17,7 +17,7 @@ import dm_pix as pix
 
 from cascade import DecoderStageA, EncoderStageA
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
-from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn, ImageFolderDataset
+from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn, ImageFolderDataset, scale
 
 
 cc.initialize_cache("jax_cache")
@@ -31,7 +31,6 @@ enc = EncoderStageA(
     down_layer_dim = (48, 96),
     down_layer_kernel_size = (3, 3),
     down_layer_blocks = (8, 8),
-    # down_layer_ordinary_conv = (True, True),
     use_bias = False ,
     conv_expansion_factor = (4, 4),
     eps = 1e-6,
@@ -45,7 +44,6 @@ dec = DecoderStageA(
     up_layer_dim = (96, 48),
     up_layer_kernel_size = (3, 3),
     up_layer_blocks = (8, 8),
-    # up_layer_ordinary_conv = (True, True) ,
     use_bias = False ,
     conv_expansion_factor = (4, 4),
     eps = 1e-6,
@@ -71,7 +69,9 @@ enc_params_flatten = unflatten_dict(load_file(f"{model_path}/enc_params.safetens
 dec_params_flatten = unflatten_dict(load_file(f"{model_path}/dec_params.safetensors"))
 
 image_path = 'a70460fe4349ffc329aca41e45a91e5e.jpg'
+image_path = "thispersondoesnotexist.jpeg"
 image = cv2.imread(image_path) / 255 * 2 - 1
+image = scale(image, 0.25)
 
 latents = jax.jit(enc.apply)(enc_params_flatten, image[None,...])
 image_logits = jax.jit(dec.apply)(dec_params_flatten, latents)
