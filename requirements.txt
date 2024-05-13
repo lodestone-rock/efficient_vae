@@ -13,4 +13,5 @@ wandb
 datasets
 aqtp
 safetensors
+dm-pix
 # manually install jax!

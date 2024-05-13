@@ -3,6 +3,12 @@ from typing import Callable
 import numpy as np
 import cv2
 
+def get_overlapping_keys(dict_a, dict_b):
+    return [key for key in dict_a.keys() if key in dict_b]
+
+def exclude_keys_from_list(keys_list, exclude_keys):
+    return [key for key in keys_list if key not in exclude_keys]
+
 def flatten_dict(dictionary, parent_key='', sep='.'):
     items = []
     for key, value in dictionary.items():
