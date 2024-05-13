@@ -23,9 +23,15 @@ class EfficientConvRMS(nn.Module):
     use_bias: bool = False # removing bias won't affect the model much
     eps:float = 1e-6
     residual: bool = True # toggle residual identity path (useful for first layer)
+    checkpoint: bool = True
 
     def setup(self):
-
+        if self.checkpoint:
+            conv = nn.checkpoint(nn.Conv)
+            dense = nn.checkpoint(nn.Dense)
+        else:
+            conv = nn.Conv
+            dense = nn.Dense
         self.group_norm = nn.RMSNorm(
             epsilon=self.eps, 
             dtype=jnp.float32,
@@ -33,7 +39,7 @@ class EfficientConvRMS(nn.Module):
         )
         # using classical conv on early layer will increase flops but make it faster to train 
         if self.group_count == -1:
-            self.conv = nn.Conv(
+            self.conv = conv(
                 features=self.features * self.expansion_factor,
                 kernel_size=(self.kernel_size, self.kernel_size), 
                 strides=(1, 1),
@@ -44,22 +50,22 @@ class EfficientConvRMS(nn.Module):
             pass
         else:
             # pointwise conv reformulated as matmul
-            self.pointwise_expand = nn.Dense(
+            self.pointwise_expand = dense(
                 features=self.features * self.expansion_factor, 
                 use_bias=self.use_bias
             )
-            self.depthwise = nn.Conv(
+            self.depthwise = conv(
                 features=self.features * self.expansion_factor,
                 kernel_size=(self.kernel_size, self.kernel_size), 
                 strides=(1, 1),
                 padding="SAME",
-                feature_group_count=self.features * self.expansion_factor // self.group_count,
+                feature_group_count=self.group_count,
                 use_bias=self.use_bias,
             )
     
         # activation
         # pointwise conv reformulated as matmul
-        self.pointwise_contract = nn.Dense(
+        self.pointwise_contract = dense(
             features=self.features, 
             use_bias=self.use_bias,
             kernel_init=jax.nn.initializers.zeros
@@ -285,7 +291,7 @@ class EncoderStageA(nn.Module):
     conv_expansion_factor: Tuple = (2, 2)
     eps:float = 1e-6
     group_count: int = (-1, -1)
-
+    checkpoint: bool = True
 
     def setup(self):
 
@@ -318,7 +324,7 @@ class EncoderStageA(nn.Module):
                     group_count=self.group_count[stage],
                     use_bias=self.use_bias,
                     eps=self.eps,
-                    # classic_conv=self.down_layer_ordinary_conv[stage],
+                    checkpoint=self.checkpoint,
                     residual=True,
                 )
 
@@ -360,6 +366,7 @@ class DecoderStageA(nn.Module):
     conv_expansion_factor: Tuple = (2, 2)
     eps:float = 1e-6
     group_count: int = (-1, -1)
+    checkpoint: bool = True
 
     def setup(self):
         
@@ -382,7 +389,7 @@ class DecoderStageA(nn.Module):
                     group_count=self.group_count[stage],
                     use_bias=self.use_bias,
                     eps=self.eps,
-                    # classic_conv=self.up_layer_ordinary_conv[stage],
+                    checkpoint=self.checkpoint,
                     residual=True,
                 )
 
@@ -476,7 +483,7 @@ class UNetEncoderStageB(nn.Module):
     conv_expansion_factor: Tuple = (2, 2)
     eps:float = 1e-6
     group_count: int = (-1, -1)
-
+    checkpoint: bool = True
     def setup(self):
 
         self.projections = nn.Dense(
@@ -487,8 +494,14 @@ class UNetEncoderStageB(nn.Module):
         # down
         down_projections = []
         down_blocks = []
+        control_blocks = []
 
         for stage, layer_count in enumerate(self.down_layer_blocks):
+            control_projections = nn.Dense(
+                features=self.down_layer_dim[stage],
+                use_bias=self.use_bias,
+            )
+            control_blocks.append(control_projections)           
             if stage + 1 != len(self.down_layer_blocks):
                 input_proj = Downsample(
                     features=self.down_layer_dim[stage + 1],
@@ -508,6 +521,7 @@ class UNetEncoderStageB(nn.Module):
                     use_bias=self.use_bias,
                     eps=self.eps,
                     residual=True,
+                    checkpoint=self.checkpoint,
                 )
 
                 modulator = Modulator(
@@ -517,17 +531,22 @@ class UNetEncoderStageB(nn.Module):
                 down_layers.append([down_layer, modulator])
             down_blocks.append(down_layers)
 
-        self.blocks = list(zip(down_projections, down_blocks))
+        self.blocks = list(zip(down_projections, down_blocks, control_blocks))
 
-    def __call__(self, image, timestep):
+    def __call__(self, image, timestep, control=None):
         image = self.projections(image)
         skips_for_decoder = []
-        for i, (downsample, conv_layers) in enumerate(self.blocks):
+        for i, (downsample, conv_layers, control_proj) in enumerate(self.blocks):
             # skip connection for the decoder
             for conv_layer, modulator in conv_layers:
                 # timestep information is inserted here
                 image = modulator(image, timestep)
                 image = conv_layer(image)
+            # controlnet injection
+            if control is not None:
+                n, h, w, c = image.shape
+                nc, hc, wc, cc = control.shape
+                image = image + control_proj(jax.image.resize(control, shape=(n, h, w, cc), method="bicubic"))
             skips_for_decoder.insert(0, image)
 
             # no downsample last layer
@@ -547,6 +566,7 @@ class UNetDecoderStageB(nn.Module):
     conv_expansion_factor: Tuple = (2, 2)
     eps:float = 1e-6
     group_count: int = (-1, -1)
+    checkpoint: bool = True
 
     def setup(self):
 
@@ -565,6 +585,7 @@ class UNetDecoderStageB(nn.Module):
                     use_bias=self.use_bias,
                     eps=self.eps,
                     residual=True,
+                    checkpoint=self.checkpoint,
                 )
                 modulator = Modulator(
                     features=self.up_layer_dim[stage],
@@ -647,6 +668,7 @@ class UNetStageB(nn.Module):
     use_bias: bool = False 
     timestep_dim: int = 320
     eps:float = 1e-6
+    checkpoint: bool = True
 
     def setup(self):
         self.time_embed = FourierLayers(
@@ -663,6 +685,7 @@ class UNetStageB(nn.Module):
             conv_expansion_factor=self.down_conv_expansion_factor,
             eps=self.eps,
             group_count=self.down_group_count,
+            checkpoint=self.checkpoint,
         )
 
         self.decoder = UNetDecoderStageB(
@@ -674,11 +697,12 @@ class UNetStageB(nn.Module):
             conv_expansion_factor=self.up_conv_expansion_factor,
             eps=self.eps,
             group_count=self.up_group_count,
+            checkpoint=self.checkpoint,
         )
 
-    def __call__(self, image, timestep):
+    def __call__(self, image, timestep, control=None):
         timestep = self.time_embed(timestep)
-        skips = self.encoder(image, timestep)
+        skips = self.encoder(image, timestep, control)
         image = self.decoder(skips, timestep)
         return image
 
@@ -695,7 +719,7 @@ class EfficientCrossAttnStageC(nn.Module):
     conv_expansion_factor: Tuple = (2, 2)
     eps:float = 1e-6
     group_count: int = (-1, -1)
-
+    checkpoint: bool = True
 
     def setup(self):
         self.time_embed = FourierLayers(
@@ -736,6 +760,7 @@ class EfficientCrossAttnStageC(nn.Module):
                     use_bias=self.use_bias,
                     eps=self.eps,
                     residual=True,
+                    checkpoint=self.checkpoint,
                 )
                 modulator = Modulator(
                     features=self.layer_dim,
