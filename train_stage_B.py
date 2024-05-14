@@ -82,13 +82,13 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
         )
 
         unet = UNetStageB(
-            down_layer_dim = (72, 144, 256),
+            down_layer_dim = (128, 192, 256),
             down_layer_kernel_size = (3, 3, 3, 3),
             down_layer_blocks = (8, 12, 14),
             down_group_count = (-1, -1, -1),
             down_conv_expansion_factor = (4, 4, 4),
 
-            up_layer_dim = (256, 144, 72),
+            up_layer_dim = (256, 192, 128),
             up_layer_kernel_size = (3, 3, 3),
             up_layer_blocks = (14, 12, 8),
             up_group_count = (-1, -1, -1),
@@ -401,7 +401,7 @@ def main():
         seed=SEED, 
         learning_rate=LEARNING_RATE
     )
-
+    STEPS = 0
     if LOAD_CHECKPOINTS != 0:
         print(f"RESUMING FROM CHECKPOINT:{LOAD_CHECKPOINTS}")
         STEPS = LOAD_CHECKPOINTS
@@ -427,7 +427,6 @@ def main():
 
     sample_image = np.concatenate([cv2.imread(f"sample_{x}.jpg")[None, ...] for x in range(4)] * int(BATCH_SIZE//4), axis=0) / 255 * 2 - 1
 
-    STEPS = 0
     # UNJITTED
     train_flow_based_jit = jax.jit(train_flow_based, static_argnames=["upscale_factor"])
     for _ in range(EPOCHS):
@@ -495,9 +494,9 @@ def main():
                     save_file(flatten_dict(unet_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/unet_params.safetensors")
                     save_file(flatten_dict(unet_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/unet_mu.safetensors")
                     save_file(flatten_dict(unet_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/unet_nu.safetensors")
-                    save_file(flatten_dict(unet_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/controlnet_params.safetensors")
-                    save_file(flatten_dict(unet_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/controlnet_mu.safetensors")
-                    save_file(flatten_dict(unet_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/controlnet_nu.safetensors")
+                    save_file(flatten_dict(controlnet_state.params), f"{SAVE_MODEL_PATH}/{STEPS}/controlnet_params.safetensors")
+                    save_file(flatten_dict(controlnet_state.opt_state[1][0].mu), f"{SAVE_MODEL_PATH}/{STEPS}/controlnet_mu.safetensors")
+                    save_file(flatten_dict(controlnet_state.opt_state[1][0].nu), f"{SAVE_MODEL_PATH}/{STEPS}/controlnet_nu.safetensors")
 
 
                 except Exception as e:
