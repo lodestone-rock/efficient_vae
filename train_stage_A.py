@@ -1,27 +1,22 @@
 import os
 import random
 
-import flax
 import numpy as np
 import jax
 from safetensors.numpy import save_file, load_file
 from jax.experimental.compilation_cache import compilation_cache as cc
 import jax.numpy as jnp
-from einops import rearrange
 from flax.training import train_state
 import optax
 from lpips_j.lpips import LPIPS
-import flax.linen as nn
-import orbax.checkpoint
 from tqdm import tqdm
 import wandb
 import jmp
 import cv2
-import dm_pix as pix
 
 from vae import DecoderStageA, EncoderStageA
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
-from streaming_dataloader import CustomDataset, threading_dataloader, collate_fn, ImageFolderDataset
+from streaming_dataloader import threading_dataloader, collate_fn, ImageFolderDataset
 
 # sharding
 from jax.sharding import Mesh
@@ -53,11 +48,10 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
             down_layer_dim = (48, 96),
             down_layer_kernel_size = (3, 3),
             down_layer_blocks = (8, 8),
-            down_layer_ordinary_conv = (True, True),
             use_bias = False ,
             conv_expansion_factor = (4, 4),
             eps = 1e-6,
-            group_count = 16,
+            group_count = (-1, -1)
 
 
         )
@@ -67,11 +61,10 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
             up_layer_dim = (96, 48),
             up_layer_kernel_size = (3, 3),
             up_layer_blocks = (8, 8),
-            up_layer_ordinary_conv = (True, True) ,
             use_bias = False ,
             conv_expansion_factor = (4, 4),
             eps = 1e-6,
-            group_count = 16,
+            group_count = (-1, -1)
         )
 
         lpips = LPIPS()
@@ -239,7 +232,7 @@ def main():
     train_rng = jax.random.PRNGKey(SEED)
     # init model
     models = init_model(batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
-
+    STEPS = 0
     if LOAD_CHECKPOINTS != 0:
         print(f"RESUMING FROM CHECKPOINT:{LOAD_CHECKPOINTS}")
         STEPS = LOAD_CHECKPOINTS
@@ -296,8 +289,6 @@ def main():
 
     sample_image = np.concatenate([cv2.imread(f"sample_{x}.jpg")[None, ...] for x in range(4)] * int(BATCH_SIZE//4), axis=0) / 255 * 2 - 1
 
-    STEPS = 0
-
     for _ in range(EPOCHS):
         # dataset = CustomDataset(parquet_url, square_size=IMAGE_RES)
         dataset = ImageFolderDataset(TRAINING_IMAGE_PATH, square_size=IMAGE_RES, seed=STEPS)
@@ -314,8 +305,6 @@ def main():
             batch[0] = rando_colours(IMAGE_RES)
             batch_og = batch / 255 * 2 - 1
 
-            # batch_blur = pix.gaussian_blur(batch_og, 1, 3)
-            # batch = jnp.clip(batch_og + (batch_og - batch_blur) * 1.5, -1, 1)
             batch = batch_og
 
             batch = jax.tree_map(
