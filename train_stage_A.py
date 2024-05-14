@@ -196,6 +196,66 @@ def train_vae_only(models, batch, loss_scale, train_rng):
 
     return new_models_state, new_train_rng, pred_batch, {**vae_loss_stats, **loss_stats}
 
+@jax.jit(static_argnames=["noise_ratio"])
+def fine_tune_vae_only(models, batch, loss_scale, train_rng, noise_ratio):
+    # always create new RNG!
+    vae_rng, new_train_rng = jax.random.split(train_rng, num=2)
+
+    # unpack model
+    enc_state, dec_state, lpips_state = models
+
+    def _vae_loss(enc_params, dec_params, lpips_params, batch, loss_scale, vae_rng):
+        # cast input
+        enc_params, dec_params, lpips_params, batch = mixed_precision_policy.cast_to_compute((enc_params, dec_params, lpips_params, batch))
+        latents = enc_state.apply_fn(enc_params, batch)
+        noise = jax.random.normal(vae_rng, shape=latents.shape)
+
+        # noise the input slightly so the model is able to generate slightly noisy latents
+        lerp_ratio = noise_ratio
+        latents = latents * (1-lerp_ratio) + noise * lerp_ratio 
+        
+        pred_batch = dec_state.apply_fn(dec_params, latents)
+
+        # MSE loss
+        mse_loss = ((batch - pred_batch) ** 2).mean()
+        # lpips loss
+        lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
+
+        vae_loss = mixed_precision_policy.cast_to_output(
+            mse_loss * loss_scale["mse_loss_scale"] + 
+            lpips_loss * loss_scale["lpips_loss_scale"]
+        )
+
+        vae_loss_stats = {
+            "mse_loss": mse_loss * loss_scale["mse_loss_scale"],
+            "lpips_loss": lpips_loss * loss_scale["lpips_loss_scale"],
+        }
+        return vae_loss, (vae_loss_stats, pred_batch)
+    
+    vae_loss_grad_fn = jax.value_and_grad(
+        fun=_vae_loss, argnums=[0], has_aux=True  # differentiate encoder and decoder
+    )
+   
+    (vae_loss, (vae_loss_stats, pred_batch)), vae_grad = vae_loss_grad_fn(
+        enc_state.params, 
+        dec_state.params, 
+        lpips_state.params, 
+        batch, 
+        loss_scale, 
+        vae_rng
+    )
+    # update vae params
+    new_enc_state = enc_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[0]))
+    # new_dec_state = dec_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[1]))
+    new_dec_state = dec_state
+
+    # pack models 
+    new_models_state = new_enc_state, new_dec_state, lpips_state
+
+    loss_stats =  {"vae_loss": vae_loss}
+
+    return new_models_state, new_train_rng, pred_batch, {**vae_loss_stats, **loss_stats}
+
 
 @jax.jit
 def inference(models, batch):
@@ -220,10 +280,11 @@ def main():
 
     }
     WANDB_PROJECT_NAME = "vae"
+    FINETUNE = True
     WANDB_RUN_NAME = "PINVAE"
     WANDB_LOG_INTERVAL = 100
     LOAD_CHECKPOINTS = 0
-
+    FT_NOISE_RATIO = 0.2
     # wandb logging
     if WANDB_PROJECT_NAME:
         wandb.init(project=WANDB_PROJECT_NAME, name=WANDB_RUN_NAME)
@@ -314,9 +375,13 @@ def main():
                 batch,
             )
 
-            models, train_rng, output, stats = train_vae_only(models, batch, LOSS_SCALE, train_rng)
+            if FINETUNE:
+                models, train_rng, output, stats = fine_tune_vae_only(models, batch, LOSS_SCALE, train_rng)
+            else:
+                models, train_rng, output, stats = train_vae_only(models, batch, LOSS_SCALE, train_rng, FT_NOISE_RATIO)
+            
 
-            if i % WANDB_LOG_INTERVAL == 0:
+            if STEPS % WANDB_LOG_INTERVAL == 0:
                 wandb.log(stats, step=STEPS)
                 preview_test = inference(models, sample_image)
                 preview = jnp.concatenate([batch_og[:4], output[:4], preview_test[:4]], axis = 0)
@@ -334,7 +399,7 @@ def main():
 
 
             # save every n steps
-            if i % SAVE_EVERY == 0:
+            if STEPS % SAVE_EVERY == 0:
                 try:
                     preview_test = inference(models, sample_image)
                     preview = jnp.concatenate([batch_og[:4], output[:4], preview_test[:4]], axis = 0)
