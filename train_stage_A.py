@@ -299,28 +299,30 @@ def main():
         STEPS = LOAD_CHECKPOINTS
         # load from safetensors
         enc_params = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/enc_params.safetensors"))
-        enc_mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/enc_mu.safetensors"))
-        enc_nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/enc_nu.safetensors"))
-
         models[0].params.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), enc_params))
-        models[0].opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), enc_mu))
-        models[0].opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), enc_nu))
+        del enc_params
+
+        try:
+            enc_mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/enc_mu.safetensors"))
+            enc_nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/enc_nu.safetensors"))
+            models[0].opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), enc_mu))
+            models[0].opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), enc_nu))
+            del enc_mu, enc_nu
+        except Exception as e:
+            print("ADAM OPTIMIZER STATE IS NOT FOUND FOR THE ENCODER. THE OPTIMIZER STATE WILL BE RANDOMLY INITIALIZED")
 
         dec_params = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_params.safetensors"))
-        dec_mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_mu.safetensors"))
-        dec_nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_nu.safetensors"))
-
         models[0].params.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_params))
-        models[0].opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_mu))
-        models[0].opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_nu))
-        del (
-            enc_params,
-            enc_mu,
-            enc_nu,
-            dec_params,
-            dec_mu,
-            dec_nu,
-        ) # flush
+        del dec_params
+
+        try:
+            dec_nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_nu.safetensors"))
+            dec_mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_mu.safetensors"))
+            models[0].opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_mu))
+            models[0].opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_nu))
+            del dec_mu, dec_nu
+        except Exception as e:
+            print("ADAM OPTIMIZER STATE IS NOT FOUND FOR THE DECODER. THE OPTIMIZER STATE WILL BE RANDOMLY INITIALIZED")
 
 
     def rando_colours(IMAGE_RES):
