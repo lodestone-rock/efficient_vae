@@ -70,15 +70,16 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
         )
 
         controlnet = EncoderStageA(
-            first_layer_output_features = 96,
-            output_features = 16,
-            down_layer_dim = (96, 128),
-            down_layer_kernel_size = (3, 3),
-            down_layer_blocks = ( 10, 12),
+            first_layer_output_features = 128,
+            output_features = 128,
+            down_layer_dim = (128,),
+            down_layer_kernel_size = (3,),
+            down_layer_blocks = (15,),
             use_bias = False,
-            conv_expansion_factor = ( 4, 4),
+            conv_expansion_factor = (4,),
             eps = 1e-6,
-            group_count = (-1,  -1)
+            group_count = (-1,),
+            downscale = False
         )
 
         unet = UNetStageB(
@@ -106,7 +107,7 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
         image = jnp.ones((batch_size, training_res, training_res, 3))
         # encoder
         enc_params = enc.init(jax.random.PRNGKey(0), image)
-        controlnet_image = jnp.ones((batch_size, training_res//controlnet_input_compression, training_res//controlnet_input_compression, 3))
+        controlnet_image = jnp.ones((batch_size, training_res//controlnet_input_compression, training_res//controlnet_input_compression, latent_dim))
         controlnet_params = controlnet.init(jax.random.PRNGKey(0), controlnet_image)
         # decoder
         dummy_latent = jnp.ones((batch_size, training_res // compression_ratio, training_res // compression_ratio, latent_dim))
@@ -212,7 +213,7 @@ def train_flow_based(unet_state, controlnet_state, enc_state, upscale_factor, ba
     # reminder NHWC
     n, h, w, c = batch.shape
     normal_latents = enc_state.call(enc_state.params, batch)
-    downscaled_latents = enc_state.call(enc_state.params, jax.image.resize(batch, shape=(n, int(h/upscale_factor), int(w/upscale_factor), c)))
+    downscaled_latents = enc_state.call(enc_state.params, jax.image.resize(batch, shape=(n, int(h/upscale_factor), int(w/upscale_factor), c), method="linear"))
 
     def _compute_loss(
         unet_params, controlnet_params, latents, downscaled_latents, rng_key
@@ -331,7 +332,7 @@ def rando_colours(image_res):
 def inference(unet_state, controlnet_state, enc_state, dec_state, batch, stage_a_compression_ratio, stage_a_latent_size, controlnet_scale_factor, seed, t_span, dt, cfg_scale=1):
 
     n, h, w, c = batch.shape
-    small_latents = jax.jit(enc_state.call(enc_state.params, jax.image.resize(batch, shape=(n, int(h/controlnet_scale_factor), int(w/controlnet_scale_factor), c)))) 
+    small_latents = jax.jit(enc_state.call)(enc_state.params, jax.image.resize(batch, shape=(n, int(h/controlnet_scale_factor), int(w/controlnet_scale_factor), c), method="linear"))
     # initial noise + low res latent
     # UNJITTED
     cond_latents = jax.jit(controlnet_state.apply_fn)(controlnet_state.params, small_latents)
@@ -352,16 +353,17 @@ def main():
     SEED = 0
     EPOCHS = 100
     SAVE_MODEL_PATH = "stage-b-latents"
-    STAGE_A_PATH = "stage_a_safetensors/119092"
+    STAGE_A_PATH = "stage_a_safetensors"
     TRAINING_IMAGE_PATH = "ramdisk/train_images"
     IMAGE_OUTPUT_PATH = "output-stage-b-latents"
     IMAGE_RES = 256
     LATENT_DIM = 4 # stage A latent dim
     COMPRESSION_RATIO = 4 # stage A compression ratio
     UPSCALE_FACTOR = 4 # image downscaled then piped to stage A latents for conditional stage B
+    CONTROLNET_LATENT_DIM = 128
     SAVE_EVERY = 5000
     LEARNING_RATE = 1e-4
-    WANDB_PROJECT_NAME = "cascade"
+    WANDB_PROJECT_NAME = "debug"
     WANDB_RUN_NAME = "stage-b-latents"
     WANDB_LOG_INTERVAL = 100
     LOAD_CHECKPOINTS = 0
@@ -384,7 +386,8 @@ def main():
         compression_ratio=COMPRESSION_RATIO,
         stage_a_path=STAGE_A_PATH, 
         seed=SEED, 
-        learning_rate=LEARNING_RATE
+        learning_rate=LEARNING_RATE,
+        controlnet_latent_dim=CONTROLNET_LATENT_DIM
     )
     STEPS = 0
     if LOAD_CHECKPOINTS != 0:
@@ -456,7 +459,7 @@ def main():
                 # grab a handfull of images to test model perf
                 eval_sample = jnp.concatenate([batch[:4], sample_image[:4]], axis = 0)
 
-                model_eval = inference(unet_state, controlnet_state, dec_state, eval_sample, COMPRESSION_RATIO, LATENT_DIM, UPSCALE_FACTOR, 0, (1, 0.001), 0.01, 1.1)
+                model_eval = inference(unet_state, controlnet_state, enc_state, dec_state, eval_sample, COMPRESSION_RATIO, LATENT_DIM, UPSCALE_FACTOR, 0, (1, 0.001), 0.01, 1.1)
 
                 preview = jnp.concatenate([eval_sample, model_eval], axis=0)
                 preview = (preview + 1) / 2 * 255

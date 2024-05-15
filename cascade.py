@@ -284,6 +284,7 @@ class Downsample(nn.Module):
 class EncoderStageA(nn.Module):
     first_layer_output_features: int = 24
     output_features: int = 4
+    downscale: float = True
     down_layer_dim: Tuple = (48, 96)
     down_layer_kernel_size: Tuple = (3, 3)
     down_layer_blocks: Tuple = (2, 2)
@@ -309,10 +310,13 @@ class EncoderStageA(nn.Module):
         down_blocks = []
 
         for stage, layer_count in enumerate(self.down_layer_blocks):
-            input_proj = Downsample(
-                features=self.down_layer_dim[stage],
-                use_bias=self.use_bias,
-            )
+            if self.downscale:
+                input_proj = Downsample(
+                    features=self.down_layer_dim[stage],
+                    use_bias=self.use_bias,
+                )
+            else:
+                input_proj = None
             down_projections.append(input_proj)
             
             down_layers = []
@@ -346,7 +350,8 @@ class EncoderStageA(nn.Module):
     def __call__(self, image):
         image = self.input_conv(image)
         for downsample, conv_layers in self.blocks:
-            image = downsample(image)
+            if self.downscale:
+                image = downsample(image)
             for conv_layer in conv_layers:
                 image = conv_layer(image)
         image = self.final_norm(image)
