@@ -363,7 +363,7 @@ def main():
     CONTROLNET_LATENT_DIM = 128
     SAVE_EVERY = 5000
     LEARNING_RATE = 1e-4
-    WANDB_PROJECT_NAME = "debug"
+    WANDB_PROJECT_NAME = "cascade"
     WANDB_RUN_NAME = "stage-b-latents"
     WANDB_LOG_INTERVAL = 100
     LOAD_CHECKPOINTS = 0

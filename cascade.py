@@ -364,6 +364,7 @@ class EncoderStageA(nn.Module):
 class DecoderStageA(nn.Module):
     last_upsample_layer_output_features: int = 24
     output_features: int = 3
+    upscale: float = True
     up_layer_dim: Tuple = (96, 24)
     up_layer_kernel_size: Tuple = (3, 3)
     up_layer_blocks: Tuple = (2, 2)
@@ -403,18 +404,21 @@ class DecoderStageA(nn.Module):
 
             # TODO: add a way to disable this projection so the identity path is uninterrupted
             # projection layer (pointwise conv) 
-            if stage + 1 == len(self.up_layer_blocks):
-                output_proj = Upsample(
-                    features=self.up_layer_dim[-1],
-                    use_bias=self.use_bias,
-                )
+            if self.upscale:
+                if stage + 1 == len(self.up_layer_blocks):
+                    output_proj = Upsample(
+                        features=self.up_layer_dim[-1],
+                        use_bias=self.use_bias,
+                    )
 
+                else:
+
+                    output_proj = Upsample(
+                        features=self.up_layer_dim[stage + 1],
+                        use_bias=self.use_bias,
+                    )
             else:
-
-                output_proj = Upsample(
-                    features=self.up_layer_dim[stage + 1],
-                    use_bias=self.use_bias,
-                )
+                output_proj = None
             up_projections.append(output_proj)
             
 

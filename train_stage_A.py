@@ -1,5 +1,7 @@
 import os
 import random
+from functools import partial
+import shutil
 
 import numpy as np
 import jax
@@ -14,7 +16,7 @@ import wandb
 import jmp
 import cv2
 
-from vae import DecoderStageA, EncoderStageA
+from cascade import DecoderStageA, EncoderStageA
 from utils import FrozenModel, create_image_mosaic, flatten_dict, unflatten_dict
 from streaming_dataloader import threading_dataloader, collate_fn, ImageFolderDataset
 
@@ -196,7 +198,7 @@ def train_vae_only(models, batch, loss_scale, train_rng):
 
     return new_models_state, new_train_rng, pred_batch, {**vae_loss_stats, **loss_stats}
 
-@jax.jit(static_argnames=["noise_ratio"])
+@partial(jax.jit, static_argnames=['noise_ratio'])
 def fine_tune_vae_only(models, batch, loss_scale, train_rng, noise_ratio):
     # always create new RNG!
     vae_rng, new_train_rng = jax.random.split(train_rng, num=2)
@@ -233,7 +235,7 @@ def fine_tune_vae_only(models, batch, loss_scale, train_rng, noise_ratio):
         return vae_loss, (vae_loss_stats, pred_batch)
     
     vae_loss_grad_fn = jax.value_and_grad(
-        fun=_vae_loss, argnums=[0], has_aux=True  # differentiate encoder and decoder
+        fun=_vae_loss, argnums=[1], has_aux=True  # differentiate encoder and decoder
     )
    
     (vae_loss, (vae_loss_stats, pred_batch)), vae_grad = vae_loss_grad_fn(
@@ -245,9 +247,9 @@ def fine_tune_vae_only(models, batch, loss_scale, train_rng, noise_ratio):
         vae_rng
     )
     # update vae params
-    new_enc_state = enc_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[0]))
-    # new_dec_state = dec_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[1]))
-    new_dec_state = dec_state
+    # new_enc_state = enc_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[0]))
+    new_enc_state = enc_state
+    new_dec_state = dec_state.apply_gradients(grads=jmp.cast_to_full(vae_grad[0]))
 
     # pack models 
     new_models_state = new_enc_state, new_dec_state, lpips_state
@@ -266,25 +268,32 @@ def inference(models, batch):
     return dec_state.apply_fn(dec_params, latents)
 
 def main():
-    BATCH_SIZE = 256
+    BATCH_SIZE = 128
     SEED = 0
     EPOCHS = 100
     SAVE_MODEL_PATH = "vae_small_ckpt"
     TRAINING_IMAGE_PATH = "ramdisk/train_images"
     IMAGE_RES = 256
     SAVE_EVERY = 500
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 5e-5
     LOSS_SCALE = {
         "mse_loss_scale": 1,
         "lpips_loss_scale": 0.25,
 
     }
-    WANDB_PROJECT_NAME = "vae"
+    WANDB_PROJECT_NAME = "debug"
     FINETUNE = True
     WANDB_RUN_NAME = "PINVAE"
     WANDB_LOG_INTERVAL = 100
-    LOAD_CHECKPOINTS = 0
-    FT_NOISE_RATIO = 0.2
+    LOAD_CHECKPOINTS = 119092
+    FT_NOISE_RATIO = 0.05
+    IMAGE_OUTPUT_PATH = "vae_output"
+    PERMANENT_EPOCH_STORE = 1000
+    MAX_TO_SAVE = 3
+
+    if not os.path.exists(IMAGE_OUTPUT_PATH):
+        os.makedirs(IMAGE_OUTPUT_PATH)
+    
     # wandb logging
     if WANDB_PROJECT_NAME:
         wandb.init(project=WANDB_PROJECT_NAME, name=WANDB_RUN_NAME)
@@ -312,14 +321,14 @@ def main():
             print("ADAM OPTIMIZER STATE IS NOT FOUND FOR THE ENCODER. THE OPTIMIZER STATE WILL BE RANDOMLY INITIALIZED")
 
         dec_params = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_params.safetensors"))
-        models[0].params.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_params))
+        models[1].params.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_params))
         del dec_params
 
         try:
             dec_nu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_nu.safetensors"))
             dec_mu = unflatten_dict(load_file(f"{SAVE_MODEL_PATH}/{STEPS}/dec_mu.safetensors"))
-            models[0].opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_mu))
-            models[0].opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_nu))
+            models[1].opt_state[1][0].mu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_mu))
+            models[1].opt_state[1][0].nu.update(jax.tree_map(lambda leaf: jax.device_put(leaf, device=NamedSharding(mesh, PartitionSpec())), dec_nu))
             del dec_mu, dec_nu
         except Exception as e:
             print("ADAM OPTIMIZER STATE IS NOT FOUND FOR THE DECODER. THE OPTIMIZER STATE WILL BE RANDOMLY INITIALIZED")
@@ -378,9 +387,9 @@ def main():
             )
 
             if FINETUNE:
-                models, train_rng, output, stats = fine_tune_vae_only(models, batch, LOSS_SCALE, train_rng)
+                models, train_rng, output, stats = fine_tune_vae_only(models, batch, LOSS_SCALE, train_rng, FT_NOISE_RATIO)
             else:
-                models, train_rng, output, stats = train_vae_only(models, batch, LOSS_SCALE, train_rng, FT_NOISE_RATIO)
+                models, train_rng, output, stats = train_vae_only(models, batch, LOSS_SCALE, train_rng)
             
 
             if STEPS % WANDB_LOG_INTERVAL == 0:
@@ -390,15 +399,7 @@ def main():
                 preview = jnp.clip(preview, -1, 1)
                 preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
-                create_image_mosaic(preview, 3, len(preview)//3, f"output/{STEPS}.png")
-
-                preview = jnp.concatenate([batch[:4], output[:4], preview_test[:4]], axis = 0)
-                preview = jnp.clip(preview, -1, 1)
-                preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
-
-                create_image_mosaic(preview, 3, len(preview)//3, f"output_scaled/{STEPS}.png")
-
-
+                create_image_mosaic(preview, 3, len(preview)//3, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
 
             # save every n steps
             if STEPS % SAVE_EVERY == 0:
@@ -409,8 +410,8 @@ def main():
                     preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
 
-                    create_image_mosaic(preview, 3, len(preview)//3, f"output/{STEPS}.png")
-                    wandb.log({"image": wandb.Image(f'output/{STEPS}.png')}, step=STEPS)
+                    create_image_mosaic(preview, 3, len(preview)//3, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
+                    wandb.log({"image": wandb.Image(f'{IMAGE_OUTPUT_PATH}/{STEPS}.png')}, step=STEPS)
                 except Exception as e:
                     print(e)
 
@@ -429,6 +430,16 @@ def main():
                 except Exception as e:
                     print(e)
 
+
+                try:
+                    # delete checkpoint 
+                    if (STEPS - MAX_TO_SAVE * SAVE_EVERY) % PERMANENT_EPOCH_STORE == 0:
+                        pass
+                    else:
+                        shutil.rmtree(f"{SAVE_MODEL_PATH}/{STEPS - MAX_TO_SAVE * SAVE_EVERY}")
+                except:
+
+                    pass
 
             progress_bar.update(1)
             STEPS += 1
