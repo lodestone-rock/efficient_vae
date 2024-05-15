@@ -328,13 +328,14 @@ def rando_colours(image_res):
     return random.choice(pallete)
 
 
-def inference(unet_state, controlnet_state, dec_state, batch, stage_a_compression_ratio, stage_a_latent_size, controlnet_scale_factor, seed, t_span, dt, cfg_scale=1):
+def inference(unet_state, controlnet_state, enc_state, dec_state, batch, stage_a_compression_ratio, stage_a_latent_size, controlnet_scale_factor, seed, t_span, dt, cfg_scale=1):
 
     n, h, w, c = batch.shape
+    small_latents = jax.jit(enc_state.call(enc_state.params, jax.image.resize(batch, shape=(n, int(h/controlnet_scale_factor), int(w/controlnet_scale_factor), c)))) 
     # initial noise + low res latent
     # UNJITTED
-    cond_latents = jax.jit(controlnet_state.apply_fn)(controlnet_state.params, jax.image.resize(batch, shape=(n, int(h/controlnet_scale_factor), int(w/controlnet_scale_factor), c), method="bicubic"))
-    # cond_latents = controlnet_state.apply_fn(controlnet_state.params, jax.image.resize(batch, shape=(n, h//controlnet_scale_factor, w//controlnet_scale_factor, c), method="bicubic"))
+    cond_latents = jax.jit(controlnet_state.apply_fn)(controlnet_state.params, small_latents)
+    # cond_latents = controlnet_state.apply_fn(controlnet_state.params, small_latents)
     init_cond = jax.random.normal(key=jax.random.PRNGKey(seed), shape=(n, h//stage_a_compression_ratio, w//stage_a_compression_ratio, stage_a_latent_size))
 
     # solve the model
@@ -350,18 +351,18 @@ def main():
     BATCH_SIZE = 256
     SEED = 0
     EPOCHS = 100
-    SAVE_MODEL_PATH = "stage_b"
+    SAVE_MODEL_PATH = "stage-b-latents"
     STAGE_A_PATH = "stage_a_safetensors/119092"
     TRAINING_IMAGE_PATH = "ramdisk/train_images"
-    IMAGE_OUTPUT_PATH = "output_stage_b"
+    IMAGE_OUTPUT_PATH = "output-stage-b-latents"
     IMAGE_RES = 256
-    LATENT_DIM = 4
-    COMPRESSION_RATIO = 4
-    UPSCALE_FACTOR = 4/3
+    LATENT_DIM = 4 # stage A latent dim
+    COMPRESSION_RATIO = 4 # stage A compression ratio
+    UPSCALE_FACTOR = 4 # image downscaled then piped to stage A latents for conditional stage B
     SAVE_EVERY = 5000
     LEARNING_RATE = 1e-4
     WANDB_PROJECT_NAME = "cascade"
-    WANDB_RUN_NAME = "stage-b"
+    WANDB_RUN_NAME = "stage-b-latents"
     WANDB_LOG_INTERVAL = 100
     LOAD_CHECKPOINTS = 0
     PERMANENT_EPOCH_STORE = 50000
