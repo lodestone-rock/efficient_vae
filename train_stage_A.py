@@ -47,26 +47,26 @@ def init_model(batch_size = 256, training_res = 256, latent_dim=4, compression_r
         enc = EncoderStageA(
             first_layer_output_features = 24,
             output_features = 4,
-            down_layer_dim = (48, 96),
-            down_layer_kernel_size = (3, 3),
-            down_layer_blocks = (8, 8),
+            down_layer_dim = (48, 96, 128),
+            down_layer_kernel_size = (3, 3, 3),
+            down_layer_blocks = (6, 8, 8),
             use_bias = False ,
-            conv_expansion_factor = (4, 4),
+            conv_expansion_factor = (4, 4, 4),
             eps = 1e-6,
-            group_count = (-1, -1)
+            group_count = (-1, -1, -1),
 
 
         )
         dec = DecoderStageA(
             last_upsample_layer_output_features = 24,
             output_features = 3,
-            up_layer_dim = (96, 48),
-            up_layer_kernel_size = (3, 3),
-            up_layer_blocks = (8, 8),
-            use_bias = False ,
-            conv_expansion_factor = (4, 4),
+            up_layer_dim = (128, 96, 48),
+            up_layer_kernel_size = (3, 3, 3),
+            up_layer_blocks = (8, 8, 6),
+            use_bias = False,
+            conv_expansion_factor = (4, 4, 4),
             eps = 1e-6,
-            group_count = (-1, -1)
+            group_count = (-1, -1, -1),
         )
 
         lpips = LPIPS()
@@ -159,7 +159,7 @@ def train_vae_only(models, batch, loss_scale, train_rng):
         pred_batch = dec_state.apply_fn(dec_params, latents)
 
         # MSE loss
-        mse_loss = ((batch - pred_batch) ** 2).mean()
+        mse_loss = (jnp.abs(batch - pred_batch)).mean()
         # lpips loss
         lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
 
@@ -219,7 +219,7 @@ def fine_tune_vae_only(models, batch, loss_scale, train_rng, noise_ratio):
         pred_batch = dec_state.apply_fn(dec_params, latents)
 
         # MSE loss
-        mse_loss = ((batch - pred_batch) ** 2).mean()
+        mse_loss = (jnp.abs(batch - pred_batch)).mean()
         # lpips loss
         lpips_loss = lpips_state.call(lpips_params, batch, pred_batch).mean()
 
@@ -281,11 +281,11 @@ def main():
         "lpips_loss_scale": 0.25,
 
     }
-    WANDB_PROJECT_NAME = "debug"
-    FINETUNE = True
-    WANDB_RUN_NAME = "PINVAE"
+    WANDB_PROJECT_NAME = "vae"
+    FINETUNE = False
+    WANDB_RUN_NAME = "PINVAE_l1"
     WANDB_LOG_INTERVAL = 100
-    LOAD_CHECKPOINTS = 119092
+    LOAD_CHECKPOINTS = 115000
     FT_NOISE_RATIO = 0.05
     IMAGE_OUTPUT_PATH = "vae_output"
     PERMANENT_EPOCH_STORE = 1000
@@ -400,6 +400,7 @@ def main():
                 preview = np.array((preview + 1) / 2 * 255, dtype=np.uint8)
 
                 create_image_mosaic(preview, 3, len(preview)//3, f"{IMAGE_OUTPUT_PATH}/{STEPS}.png")
+                progress_bar.set_description(f"{stats['vae_loss']}")
 
             # save every n steps
             if STEPS % SAVE_EVERY == 0:
