@@ -453,6 +453,83 @@ class DecoderStageA(nn.Module):
         return image
 
 
+class RefinerStageA(nn.Module):
+    output_features: int = 3
+    upscale_factor: int = 1
+    dim: int = 24
+    kernel_size: int = 3
+    numb_resnet_blocks: int = 2
+    use_bias: bool = False 
+    expansion_factor: Tuple = 2
+    eps:float = 1e-6
+    group_count: int = -1
+    checkpoint: bool = True
+    dense: bool = False
+    residual: bool = True
+
+    def setup(self):
+        
+        self.projections = nn.Dense(
+            features=self.dim,
+            use_bias=True,
+        )
+
+        layers = []
+        for layer in range(self.numb_resnet_blocks):
+            layer = EfficientConvRMS(
+                features=self.dim,
+                kernel_size=self.kernel_size,
+                expansion_factor=self.expansion_factor,
+                group_count=self.group_count,
+                use_bias=self.use_bias,
+                eps=self.eps,
+                checkpoint=self.checkpoint,
+                residual=self.residual,
+            )
+
+            layers.append(layer)
+        self.layers = layers
+
+        self.final_norm = nn.RMSNorm(
+            epsilon=self.eps, 
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+
+        self.final_conv = nn.Conv(
+            features=self.output_features,
+            kernel_size=(3, 3), 
+            strides=(1, 1),
+            padding="SAME",
+            feature_group_count=1,
+            use_bias=True,
+            kernel_init=jax.nn.initializers.zeros,
+        )
+
+    def __call__(self, image):
+        n, h, w, c = image.shape
+        # just in case we want to train simple upscaler
+        if self.upscale_factor > 1:
+            image = jax.image.resize(
+            image,
+            shape=(n, h*self.upscale_factor, w*self.upscale_factor, c),
+            method="bicubic",
+        )
+        identity = image
+        image = self.projections(image)
+        if self.dense:
+            skips = image
+        for conv_layer in self.layers:
+            image = conv_layer(image)
+            if self.dense:
+                image = jnp.concat([skips, image], axis=-1)
+
+        image = self.final_norm(image)
+        image = self.final_conv(image) 
+        image += identity
+        return image
+
+
 class ControlNet(nn.Module):
 
     first_layer_output_features: int = 24
